@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenArm 2.0 · Data Collection</title>
+<style>
+:root{
+  --bg:#0d1117; --panel:#161b22; --line:#272e38; --ink:#c9d1d9; --dim:#7d8896;
+  --pos:#4a9d9c; --neg:#e07a5f; --cam:#9b7ede; --amber:#d4a017; --blue:#6c8ebf;
+  --ok:#3fb950; --bad:#f85149;
+}
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--bg); color:var(--ink);
+  font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+header{
+  padding:14px 20px; border-bottom:1px solid var(--line);
+  display:flex; align-items:center; gap:16px; flex-wrap:wrap;
+}
+h1{font-size:15px; margin:0; font-weight:700; letter-spacing:.2px}
+.sim{
+  background:rgba(212,160,23,.12); color:var(--amber);
+  border:1px solid rgba(212,160,23,.35); border-radius:4px;
+  padding:3px 9px; font-size:11px; font-weight:700;
+}
+main{padding:20px; display:grid; gap:18px; max-width:1400px; margin:0 auto}
+.row{display:grid; gap:18px; grid-template-columns:1fr}
+@media(min-width:1000px){ .row.split{grid-template-columns:minmax(0,1.05fr) minmax(0,1fr)} }
+.panel{background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px}
+.panel h2{
+  font-size:11px; text-transform:uppercase; letter-spacing:.9px;
+  color:var(--dim); margin:0 0 14px; font-weight:700;
+}
+
+/* ---- control bar ---- */
+.bar{display:flex; align-items:center; gap:14px; flex-wrap:wrap}
+button{
+  font:inherit; font-weight:700; cursor:pointer; border-radius:6px;
+  padding:10px 22px; border:1px solid transparent; transition:.12s;
+}
+#rec{background:var(--ok); color:#08130c; border-color:#2ea043}
+#rec:hover{filter:brightness(1.1)}
+#rec.on{background:var(--bad); color:#fff; border-color:#da3633}
+#rec:disabled{opacity:.5; cursor:not-allowed}
+.dot{width:9px; height:9px; border-radius:50%; background:var(--dim); display:inline-block}
+.dot.live{background:var(--bad); animation:pulse 1.1s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+.stats{display:flex; gap:22px; flex-wrap:wrap; margin-left:auto}
+.stat b{display:block; font-size:16px; font-weight:700}
+.stat span{font-size:10px; color:var(--dim); text-transform:uppercase; letter-spacing:.6px}
+
+/* ---- joints ---- */
+table{width:100%; border-collapse:collapse}
+th{
+  text-align:right; font-size:10px; color:var(--dim); font-weight:600;
+  text-transform:uppercase; letter-spacing:.5px; padding:0 6px 8px; white-space:nowrap;
+}
+th:first-child{text-align:left}
+td{padding:2px 6px; text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap}
+td:first-child{text-align:left; color:var(--dim)}
+tr.arm-break td{padding-top:9px}
+.meter{width:100%; min-width:90px; height:9px; background:#0b0f14;
+       border-radius:2px; position:relative; overflow:hidden}
+.meter i{position:absolute; top:0; bottom:0; left:50%; background:var(--pos)}
+.meter i.n{background:var(--neg)}
+.meter::after{content:""; position:absolute; left:50%; top:0; bottom:0;
+              width:1px; background:#2c3440}
+.stale{color:var(--bad)}
+
+/* ---- cameras ---- */
+.cams{display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px}
+.cam{border:1px solid var(--line); border-radius:6px; overflow:hidden; background:#0b0f14}
+.cam canvas{width:100%; display:block; image-rendering:pixelated; aspect-ratio:16/9;
+            background:#0b0f14}
+.cam .lbl{padding:6px 9px; font-size:10.5px; display:flex; justify-content:space-between;
+          border-top:1px solid var(--line); color:var(--cam)}
+.cam .lbl em{font-style:normal; color:var(--dim)}
+
+/* ---- episodes ---- */
+.eps{max-height:340px; overflow:auto}
+.ep{border:1px solid var(--line); border-radius:6px; padding:10px 12px; margin-bottom:8px}
+.ep .id{font-weight:700; font-size:12px}
+.ep .meta{color:var(--dim); font-size:11px; margin:3px 0 8px}
+.ep a,.ep button.dl{
+  font:inherit; font-size:10.5px; padding:4px 9px; border-radius:4px; cursor:pointer;
+  border:1px solid var(--line); background:#0b0f14; color:var(--ink);
+  text-decoration:none; display:inline-block; margin-right:5px;
+}
+.ep a:hover,.ep button.dl:hover{border-color:var(--blue); color:var(--blue)}
+.empty{color:var(--dim); text-align:center; padding:26px; font-size:12px}
+footer{color:var(--dim); font-size:11px; padding:4px 20px 26px; max-width:1400px; margin:0 auto}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>OpenArm 2.0 · Data Collection</h1>
+  <span class="sim" id="simbadge">SIMULATED — NOT A REAL ARM</span>
+</header>
+
+<main>
+  <div class="panel">
+    <div class="bar">
+      <button id="rec">● Start recording</button>
+      <span><span class="dot" id="dot"></span> <span id="recstate">idle</span></span>
+      <div class="stats">
+        <div class="stat"><b id="s-rate">—</b><span>joint Hz</span></div>
+        <div class="stat"><b id="s-spread">—</b><span>spread ms</span></div>
+        <div class="stat"><b id="s-samples">0</b><span>samples</span></div>
+        <div class="stat"><b id="s-queue">0</b><span>queue</span></div>
+        <div class="stat"><b id="s-drops">0</b><span>drops</span></div>
+        <div class="stat"><b id="s-eps">0</b><span>episodes</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="row split">
+    <div class="panel">
+      <h2>Joint states · live</h2>
+      <table>
+        <thead><tr>
+          <th>joint</th><th>pos rad</th><th style="width:34%">&nbsp;</th>
+          <th>vel rad/s</th><th>torque Nm</th>
+        </tr></thead>
+        <tbody id="joints"></tbody>
+      </table>
+    </div>
+
+    <div class="panel">
+      <h2>Camera preview</h2>
+      <div class="cams" id="cams"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Episodes</h2>
+    <div class="eps" id="eps"><div class="empty">no episodes yet</div></div>
+  </div>
+</main>
+
+<footer>
+  Polling <code>/api/live</code> at 10 Hz. Camera previews are decoded from raw RGB
+  (12-byte header, then pixels) straight into a canvas, so the server needs no image
+  encoder and the browser needs no decoder.
+</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+let recording = false, cams = [], busy = false;
+
+const fmt = (v, n = 3) => (v >= 0 ? " " : "") + v.toFixed(n);
+
+/* ---------- joints ---------- */
+function drawJoints(d) {
+  const tb = $("joints");
+  if (tb.children.length !== d.position.length) {
+    tb.innerHTML = d.position.map((_, i) =>
+      `<tr class="${i === 7 ? "arm-break" : ""}">
+         <td data-n="${i}"></td><td data-p="${i}"></td>
+         <td><div class="meter"><i data-m="${i}"></i></div></td>
+         <td data-v="${i}"></td><td data-t="${i}"></td>
+       </tr>`).join("");
+    names.forEach((n, i) => { const c = tb.querySelector(`[data-n="${i}"]`); if (c) c.textContent = n; });
+  }
+  d.position.forEach((p, i) => {
+    const pc = tb.querySelector(`[data-p="${i}"]`);
+    pc.textContent = fmt(p, 4);
+    pc.className = d.valid[i] ? "" : "stale";
+    tb.querySelector(`[data-v="${i}"]`).textContent = fmt(d.velocity[i], 3);
+    tb.querySelector(`[data-t="${i}"]`).textContent = fmt(d.torque[i], 3);
+    const bar = tb.querySelector(`[data-m="${i}"]`);
+    const frac = Math.max(-1, Math.min(1, p / 1.2));      // +/- 1.2 rad full scale
+    bar.style.width = Math.abs(frac) * 50 + "%";
+    bar.style.left = frac < 0 ? (50 + frac * 50) + "%" : "50%";
+    bar.className = frac < 0 ? "n" : "";
+  });
+  $("s-rate").textContent = d.rate_hz.toFixed(0);
+  $("s-spread").textContent = d.spread_ms.toFixed(2);
+}
+
+let names = [];
+async function loadNames() {
+  // joint names live in the episode metadata; fall back to indices
+  const live = await (await fetch("/api/live")).json();
+  names = live.position.map((_, i) => {
+    const side = i < 7 ? "left" : "right";
+    const j = ["j1 sh.pitch","j2 sh.roll","j3 sh.yaw","j4 elbow",
+               "j5 wr.roll","j6 wr.pitch","j7 wr.yaw"][i % 7];
+    return `${side} ${j}`;
+  });
+}
+
+/* ---------- cameras ---------- */
+async function setupCams() {
+  cams = await (await fetch("/api/cameras")).json();
+  $("cams").innerHTML = cams.map(c =>
+    `<div class="cam">
+       <canvas id="cv-${c.name}" width="160" height="90"></canvas>
+       <div class="lbl"><span>${c.name}</span><em>${c.fps} fps · ${c.width}×${c.height}</em></div>
+     </div>`).join("");
+}
+
+async function pollCam(c) {
+  try {
+    const buf = await (await fetch(`/api/cameras/${c.name}/frame`)).arrayBuffer();
+    const dv = new DataView(buf);
+    const h = dv.getUint32(0, true), w = dv.getUint32(4, true), ch = dv.getUint32(8, true);
+    const px = new Uint8Array(buf, 12);
+    const cv = $(`cv-${c.name}`);
+    if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+    const ctx = cv.getContext("2d");
+    const img = ctx.createImageData(w, h);
+    for (let i = 0, n = w * h; i < n; i++) {
+      img.data[i*4]   = px[i*ch];
+      img.data[i*4+1] = px[i*ch+1];
+      img.data[i*4+2] = px[i*ch+2];
+      img.data[i*4+3] = 255;
+    }
+    ctx.putImageData(img, 0, 0);
+  } catch (e) { /* a dropped preview frame is cosmetic; never break the loop */ }
+}
+
+/* ---------- status + episodes ---------- */
+async function pollStatus() {
+  const s = await (await fetch("/api/status")).json();
+  recording = s.running;
+  $("s-samples").textContent = s.joint_samples.toLocaleString();
+  $("s-queue").textContent = s.queue_depth;
+  $("s-drops").textContent = s.dropped_queue;
+  $("s-eps").textContent = s.episode_count;
+  $("rec").textContent = recording ? "■ Stop recording" : "● Start recording";
+  $("rec").className = recording ? "on" : "";
+  $("dot").className = recording ? "dot live" : "dot";
+  $("recstate").textContent = recording
+    ? `recording ${s.episode_id} · ${s.elapsed_s.toFixed(1)}s`
+    : (s.last_episode ? `idle · last ${s.last_episode}` : "idle");
+  $("simbadge").style.display = s.is_mock ? "" : "none";
+}
+
+async function loadEpisodes() {
+  const eps = await (await fetch("/api/episodes")).json();
+  $("eps").innerHTML = eps.length ? eps.map(e => `
+    <div class="ep">
+      <div class="id">${e.is_mock ? "🟡 " : ""}${e.episode_id}</div>
+      <div class="meta">
+        ${e.duration_s.toFixed(2)}s · ${e.n_joint_samples.toLocaleString()} joint samples
+        @ ${e.joint_rate_hz.toFixed(0)} Hz ·
+        ${Object.entries(e.n_frames).map(([k, v]) => `${k} ${v}`).join(" · ")} ·
+        ${(e.size_bytes / 1e6).toFixed(2)} MB
+        ${e.notes ? " · " + e.notes : ""}
+      </div>
+      <a href="/api/episodes/${e.episode_id}/download">↓ mcap</a>
+      <a href="/api/episodes/${e.episode_id}/download?fmt=h5&policy=hermite">↓ hdf5 hermite</a>
+      <a href="/api/episodes/${e.episode_id}/download?fmt=h5&policy=nearest">↓ hdf5 nearest</a>
+    </div>`).join("") : `<div class="empty">no episodes yet</div>`;
+}
+
+/* ---------- control ---------- */
+$("rec").onclick = async () => {
+  if (busy) return;
+  busy = true; $("rec").disabled = true;
+  try {
+    const r = await fetch(recording ? "/api/record/stop" : "/api/record/start", { method: "POST" });
+    if (!r.ok) alert((await r.json()).detail);
+    await pollStatus();
+    await loadEpisodes();
+  } finally { busy = false; $("rec").disabled = false; }
+};
+
+/* ---------- loops ---------- */
+(async function init() {
+  await loadNames();
+  await setupCams();
+  await pollStatus();
+  await loadEpisodes();
+
+  setInterval(async () => drawJoints(await (await fetch("/api/live")).json()), 100);
+  setInterval(pollStatus, 500);
+  setInterval(loadEpisodes, 5000);
+  cams.forEach(c => setInterval(() => pollCam(c), 100));
+})();
+</script>
+</body>
+</html>

@@ -20,7 +20,7 @@ robot learning, and serves them over a REST API with a live dashboard.
 | 2 | **CAN data reading** | ✅ **Working** | 995.8 Hz sustained against a simulated arm |
 | 3 | **Multi-camera synchronisation** | ✅ **Working** | 5 streams aligned, timing error measured per sample |
 | 4 | **Storage backend + REST API** | ✅ **Working** | MCAP capture, HDF5 export, 8 endpoints |
-| 5 | Monitoring dashboard | ⬜ Not started | |
+| 5 | **Monitoring dashboard** | ✅ **Working** | Live joints, 4 camera previews, Start/Stop |
 
 > ### ⚠️ Read this first
 >
@@ -776,7 +776,59 @@ this needs h264/AV1 with a frame-index-to-timestamp map. Both gaps are written i
 
 ## Task 5 - monitoring dashboard
 
-Not yet started. Section to follow.
+> *"A simple web dashboard showing live (or simulated) joint states, a camera feed preview,
+> episode count, and a Start / Stop recording button. Any frontend framework is fine."*
+
+✅ **Working.** Served at `/` by the same process as the API.
+
+```bash
+./.venv/bin/uvicorn openarm_pipeline.api.server:app
+#  http://127.0.0.1:8000        dashboard
+#  http://127.0.0.1:8000/docs   generated OpenAPI docs
+```
+
+| Panel | Shows |
+|---|---|
+| **Control bar** | Start/Stop, live joint rate, snapshot spread, sample count, **queue depth**, back-pressure drops, episode count |
+| **Joint states** | All 14 joints at 10 Hz with signed bars, split left arm from right. A joint whose `valid` flag is false turns red |
+| **Camera preview** | Four live canvases at their real relative rates |
+| **Episodes** | Newest first, with download links for the raw MCAP and for aligned HDF5 under either policy |
+
+### Three deliberate choices
+
+**No build step, no framework.** One HTML file with inline CSS and vanilla JS. Node is not
+installed on my machine and adding a toolchain to serve one page would be a poor trade. It also
+means the dashboard cannot rot: no lockfile, no dependency to update, and it runs from a clean
+checkout with nothing but `pip install -r requirements.txt`.
+
+**Camera frames are raw RGB decoded straight into a canvas.** The endpoint returns a 12-byte
+header (height, width, channels) followed by pixels, and the browser builds an `ImageData` from
+it. No image encoder on the server, no decoder in the client, and it reuses the exact header
+format the storage layer already uses, so there is one image convention in the project rather
+than two.
+
+**Queue depth and drops are on screen, not buried in logs.** They are the numbers that tell an
+operator the recording is in trouble *while it is still happening*, which is the only time the
+information is worth anything. A dashboard that shows only what is going well is decoration.
+
+The simulated-data banner is driven by the API's `is_mock` flag rather than hardcoded, so it
+disappears by itself the day this runs against a real arm.
+
+### Verified over HTTP
+
+```console
+GET  /                 200   11471 bytes
+GET  /docs             200
+GET  /api/live         200
+GET  /api/cameras/zed_head/frame   200
+
+POST /api/record/start  {"started":true,"episode_id":"20260810T031613_812","is_mock":true}
+POST /api/record/stop   {"stopped":true,"duration_s":3.012,"joint_samples":3009,
+                         "n_frames":{"wrist_left":89,"wrist_right":90,
+                                     "ceiling":45,"zed_head":181}}
+```
+
+Exactly the calls the buttons make.
 
 ---
 
