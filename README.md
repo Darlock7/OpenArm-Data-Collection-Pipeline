@@ -1,6 +1,6 @@
 <div align="center">
 
-# OpenArm 2.0-Data Collection Pipeline
+# OpenArm 2.0 Data Collection Pipeline
 
 **A teleoperation recording platform for the [OpenArm 2.0](https://docs.openarm.dev) bimanual robot arm.**
 Reads joint state over CAN FD, synchronises it with four camera streams, stores episodes for
@@ -50,7 +50,9 @@ python3 -m venv .venv
 
 ## Architecture
 
-Five tasks, one pipeline. Data flows left to right and each stage consumes the previous one.
+**In plain terms:** five tasks, one assembly line. The arm and cameras produce data, something
+lines it up in time, something stores it, and something serves it to a web page. Each stage feeds
+the next.
 
 ```
    ARM                    CAPTURE                 STORE              SERVE
@@ -92,6 +94,9 @@ makes alignment quality a filterable property of the dataset instead of an assum
 > *"Follow the setup guide to configure the CAN FD interfaces. Run `openarm-can-cli
 > can_configure` and set the zero position on both can0 and can1. Show a screenshot or terminal
 > output confirming the interfaces are UP and zero position is set."*
+
+**In plain terms:** turn on the cable between the computer and the arm, then tell the arm where
+"straight" is. Both steps are physical, and I had no arm.
 
 **Status: not performed.** Bringing up a CAN interface needs a physical adapter, and zeroing
 writes a value into physical motors. I had neither, and I was on macOS, which has no SocketCAN
@@ -278,6 +283,10 @@ grounding, every flag, the complete failure table, and references.
 
 > *"Read live joint position, velocity, and torque from the arm over CAN FD. If you don't have
 > hardware access, mock the CAN data stream in software and note that clearly."*
+
+**In plain terms:** listen to what the motors are saying. Each one reports its angle, speed and
+force a thousand times a second, squeezed into eight bytes. With no arm to listen to, I built a
+fake one that speaks the same eight bytes, so the code that decodes them is doing real work.
 
 ✅ **Working.** All 14 joints, decoded from genuine Damiao MIT-mode frames produced by a
 simulated arm, sustained at **995.8 Hz** against the 1 kHz target.
@@ -473,6 +482,11 @@ demonstration six months later.
 > timestamps and alignment with joint state data. How do you deal with cameras running at
 > different frame rates?"*
 
+**In plain terms:** the cameras and the motors all report at different speeds, so nothing lines
+up. If the ceiling camera only looks 15 times a second, what did the arm look like in between?
+This section is about deciding what "the same moment" means, and being honest about how wrong the
+answer is.
+
 ✅ **Working.** Four simulated cameras at 60/30/30/15 fps captured concurrently with the 1 kHz
 joint stream, then aligned on a common timeline with the timing error recorded per sample.
 
@@ -536,10 +550,12 @@ Ranked by how badly each damages a trained policy:
 | **2** | **Jitter** - an offset that varies | Worse per millisecond than bias. A constant offset can be partly absorbed into the learned dynamics; a wandering one cannot |
 | **3** | **Aliasing** - decimating 1 kHz data without filtering | Content above the new Nyquist folds down and stops looking like noise, starts looking like real motion that never happened |
 
-Every aligned sample therefore carries its **signed** timing error, `dt = t_sample - t_query`.
-Signed, not absolute, because the mean of the signed error *is* the bias. Take absolute values
-first and a 50 ms systematic offset averages to +50 and becomes indistinguishable from a 50 ms
-lead. That is exactly how a fatal misalignment ships undetected.
+So every aligned sample carries its own timing error, and the sign is kept: `dt = t_sample -
+t_query`. Negative means the sample was older than the moment asked for.
+
+Why keep the sign? Because averaging the signed errors gives you the bias directly. Throw the
+sign away first and a consistent 50 ms lag averages to +50, which looks identical to a consistent
+50 ms lead. That is exactly how a fatal misalignment ships without anyone noticing.
 
 `window_mean` exists for failure 3: a boxcar average is a crude low-pass filter, and crude and
 applied beats ideal and skipped.
@@ -649,6 +665,10 @@ shortcut, not a claim about the real cameras.
 > and justify your choice (e.g. HDF5, MCAP, zarr, custom). Include a simple REST API to list
 > episodes, retrieve metadata, and download an episode."*
 
+**In plain terms:** save the recordings to disk, and give people a way to fetch them. The part
+worth arguing about is the file format, because writing and reading want opposite things, so I
+used two formats instead of compromising on one.
+
 ✅ **Working.** MCAP for capture, HDF5 for training, eight REST endpoints.
 
 ### The question contains an assumption worth rejecting
@@ -724,9 +744,10 @@ pixels by a third for nothing.
 
 ### The recorder never lets a disk touch the capture thread
 
-A 1 kHz loop has **1 ms per cycle**. An fsync, a log rotation or a GC pause can exceed that by an
-order of magnitude. If the capture thread writes, a disk hiccup does not slow the recording down,
-it puts a **hole** in it.
+A 1 kHz loop gets **1 ms per cycle**. Writing to disk can easily take ten times that. So if the
+thread reading the arm is also the thread writing the file, one slow disk write does not make the
+recording a bit late. It puts a **hole** in it, and the hole is in your data rather than in a log
+file somewhere.
 
 So capture threads only enqueue and one writer thread drains. The queue is **bounded** on purpose:
 
@@ -817,6 +838,8 @@ this needs h264/AV1 with a frame-index-to-timestamp map. Both gaps are written i
 
 > *"A simple web dashboard showing live (or simulated) joint states, a camera feed preview,
 > episode count, and a Start / Stop recording button. Any frontend framework is fine."*
+
+**In plain terms:** a web page showing what the arm is doing right now, with a record button.
 
 ✅ **Working.** Served at `/` by the same process as the API.
 
