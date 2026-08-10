@@ -83,6 +83,7 @@ def get_status() -> dict:
         "frames": s.frames,
         "queue_depth": s.queue_depth,
         "dropped_queue": s.dropped_queue,
+        "write_errors": s.write_errors,
         "is_mock": s.is_mock,
         "last_episode": s.last_episode,
         "episode_count": len(registry.list()),

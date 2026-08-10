@@ -69,10 +69,24 @@ def export_hdf5(mcap_path: Path | str,
 
     if len(joints) == 0:
         raise ValueError(f"{mcap_path} contains no joint states")
-    if anchor not in streams:
-        raise KeyError(f"anchor {anchor!r} not in episode; have {sorted(streams)}")
 
-    ep = align(joints, streams, anchor=anchor,
+    # A crashed recording may have lost the anchor camera entirely, since its
+    # frames could sit in the destroyed tail. Refusing to export at that point
+    # throws away a partially good episode over a choice that has an obvious
+    # fallback: anchor on whichever surviving camera ran fastest, and record
+    # that a substitution happened so nobody discovers it by surprise later.
+    usable = {n: st for n, st in streams.items() if len(st) > 0}
+    if not usable:
+        raise ValueError(
+            f"{mcap_path.name} has no camera frames at all, so there is no "
+            f"timeline to anchor on. Joint states alone cannot form an episode."
+        )
+    anchor_fallback = None
+    if anchor not in usable:
+        anchor_fallback = anchor
+        anchor = max(usable, key=lambda n: usable[n].measured_fps)
+
+    ep = align(joints, usable, anchor=anchor,
                joint_policy=policy, tolerance_s=tolerance_s)
     q = ep.quality()
     n = len(ep)
@@ -94,6 +108,19 @@ def export_hdf5(mcap_path: Path | str,
         h.attrs["joints_synthetic"] = bool(ep.joint_synthetic)
         h.attrs["source_mcap"] = mcap_path.name
 
+        # Provenance for damage. Without these a truncated recording exports
+        # to something indistinguishable from a clean short episode, and a
+        # training run has no way to know it is missing the end of a
+        # demonstration.
+        h.attrs["source_truncated"] = bool(reader.truncated)
+        if anchor_fallback:
+            h.attrs["anchor_fallback_from"] = anchor_fallback
+        if reader.truncated:
+            h.attrs["warning"] = (
+                "Exported from an INCOMPLETE recording. The source was "
+                "interrupted, so this episode ends earlier than intended."
+            )
+
         # ---- alignment quality, so episodes can be filtered on it ----------
         h.attrs["joint_bias_ms"] = q["joints"]["bias_ms"]
         h.attrs["joint_jitter_ms"] = q["joints"]["jitter_ms"]
@@ -109,7 +136,7 @@ def export_hdf5(mcap_path: Path | str,
         obs.create_dataset("joint_torque", data=ep.torque, compression=compression)
 
         imgs = obs.create_group("images")
-        for cam, stream in streams.items():
+        for cam, stream in usable.items():
             if not stream.images:
                 continue
             idx = ep.camera_idx[cam]

@@ -74,7 +74,8 @@ class RecorderStatus:
     joint_samples: int = 0
     frames: dict[str, int] = field(default_factory=dict)
     queue_depth: int = 0
-    dropped_queue: int = 0     # lost to back-pressure, NOT to the bus
+    dropped_queue: int = 0     # lost to BACK-PRESSURE: the disk could not keep up
+    write_errors: int = 0      # lost to a FAILED WRITE: the disk refused
     is_mock: bool = True
     last_episode: str | None = None
 
@@ -176,6 +177,7 @@ class Recorder:
             self._status.joint_samples = 0
             self._status.frames = {c.name: 0 for c in self.cameras}
             self._status.dropped_queue = 0
+            self._status.write_errors = 0
             self._recording.set()
             return self.status()
 
@@ -270,7 +272,12 @@ class Recorder:
                 # A write failure must not kill the capture threads. The
                 # episode is compromised either way; keeping the process alive
                 # means the operator finds out now rather than at the end.
-                self._status.dropped_queue += 1
+                #
+                # Counted separately from back-pressure on purpose. "The disk
+                # cannot keep up" and "the disk refused the write" call for
+                # completely different responses, and one shared counter hides
+                # which is happening.
+                self._status.write_errors += 1
 
     # -- introspection -----------------------------------------------------
 

@@ -277,3 +277,123 @@ def test_a_dead_motor_degrades_the_recording_rather_than_stopping_it():
     assert not snapshots[-1].valid[DEAD], "the dead joint was not marked stale"
     others = [i for i in range(J) if i != DEAD]
     assert snapshots[-1].valid[others].all(), "healthy joints were marked stale"
+
+
+# ------------------------------------------------------- the disk gives out
+
+class _FailingDisk(EpisodeWriter):
+    """Accepts writes for a while, then the filesystem refuses."""
+
+    def __init__(self, directory, fail_after=200):
+        self.real = McapEpisodeWriter(directory)
+        self.n = 0
+        self.fail_after = fail_after
+
+    @property
+    def path(self):
+        return self.real.path
+
+    def open(self, meta):
+        self.real.open(meta)
+
+    def write_joint_state(self, *a, **k):
+        self.n += 1
+        if self.n > self.fail_after:
+            raise OSError(28, "No space left on device")
+        self.real.write_joint_state(*a, **k)
+
+    def write_frame(self, *a, **k):
+        if self.n > self.fail_after:
+            raise OSError(28, "No space left on device")
+        self.real.write_frame(*a, **k)
+
+    def close(self):
+        return self.real.close()
+
+
+def test_a_failing_disk_is_survived_and_reported_distinctly(tmp_path):
+    """"The disk cannot keep up" and "the disk refused the write" need
+    completely different responses, so they get different counters.
+
+    They shared one before this test, which meant an operator watching the
+    dashboard could not tell a slow disk from a broken one.
+    """
+    from openarm_pipeline.recorder import Recorder
+
+    rec = Recorder(data_dir=tmp_path,
+                   writer_factory=lambda: _FailingDisk(tmp_path, fail_after=200))
+    rec.start_capture()
+    time.sleep(0.4)
+    rec.start_recording()
+    time.sleep(2.0)
+
+    status = rec.status()
+    rate = rec.live().rate_hz
+    meta = rec.stop_recording()          # must not raise
+    rec.stop_capture()
+
+    assert meta is not None, "stop_recording raised or lost the episode"
+    assert rate > 500, f"capture collapsed to {rate:.0f} Hz on write failures"
+    assert status.write_errors > 0, "write failures were not counted"
+    assert status.dropped_queue == 0, "write failures were miscounted as back-pressure"
+
+    # and whatever landed before the failure is still readable
+    joints, _ = McapEpisodeReader(rec.data_dir / f"{meta.filename_stem}.mcap") \
+        .read(with_images=False)
+    assert len(joints) > 0
+
+
+def test_rapid_start_stop_cycles_do_not_leak_threads_or_ids(tmp_path):
+    from openarm_pipeline.recorder import Recorder
+
+    rec = Recorder(data_dir=tmp_path)
+    rec.start_capture()
+    time.sleep(0.3)
+    expected_threads = len(rec._threads)
+
+    ids = []
+    for _ in range(4):
+        rec.start_recording()
+        time.sleep(0.2)
+        m = rec.stop_recording()
+        if m:
+            ids.append(m.episode_id)
+
+    assert len(rec._threads) == expected_threads, "cycling spawned extra threads"
+    rec.stop_capture()
+
+    assert len(set(ids)) == 4, f"episode ids collided: {ids}"
+    assert len(list(tmp_path.glob("*.mcap"))) == 4
+
+
+# ------------------------------------------------------- exporting damage
+
+def test_a_truncated_episode_exports_and_says_it_was_truncated(tmp_path):
+    """A damaged recording is still worth training on, but the resulting file
+    must not be indistinguishable from a clean short episode."""
+    import h5py
+
+    meta = EpisodeMetadata(episode_id=new_episode_id(1.8e9), created_utc=1.8e9,
+                           is_mock=True, camera_names=["zed_head"])
+    w = McapEpisodeWriter(tmp_path)
+    w.open(meta)
+    for i in range(4000):                       # interleaved, as a real rig writes
+        w.write_joint_state(i * MS, np.full(J, i * 1e-4, np.float32),
+                            np.full(J, 0.5, np.float32), np.full(J, -1.0, np.float32),
+                            np.ones(J, bool), 3e-4)
+        if i % 16 == 0:
+            w.write_frame("zed_head", i * MS, i // 16, 0.008,
+                          np.full((8, 8, 3), (i // 16) % 250, np.uint8))
+    w.close()
+
+    full = tmp_path / f"{meta.filename_stem}.mcap"
+    cut = tmp_path / "cut.mcap"
+    cut.write_bytes(full.read_bytes()[: int(full.stat().st_size * 0.6)])
+
+    from openarm_pipeline.storage.export import export_hdf5
+    out = export_hdf5(cut, policy="hermite")
+
+    with h5py.File(out, "r") as h:
+        assert h["timing/t_s"].shape[0] > 0, "nothing survived the export"
+        assert bool(h.attrs["source_truncated"]) is True
+        assert "INCOMPLETE" in h.attrs["warning"]

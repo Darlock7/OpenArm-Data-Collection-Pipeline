@@ -40,7 +40,7 @@ robot learning, and serves them over a REST API with a live dashboard.
 python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
 
-./.venv/bin/python -m pytest tests/ -q          # 57 tests
+./.venv/bin/python -m pytest tests/ -q          # 61 tests
 ./.venv/bin/python scripts/read_joints.py       # live joint state, simulated arm
 ./.venv/bin/python scripts/demo_sync.py         # 5 streams captured and aligned
 ./.venv/bin/uvicorn openarm_pipeline.api.server:app   # API + dashboard on :8000
@@ -933,7 +933,28 @@ streaming record iterator so a footerless file still yields its contents. Recove
 now raises rather than returning an empty episode, because a caller must never mistake rubble for
 a take the operator stopped immediately.
 
-### 2. Two concurrent Start requests both returned success
+### 2. A damaged episode could not be exported at all
+
+If the anchor camera's frames sat in the destroyed tail of a crashed recording, the export
+raised `KeyError` and the whole episode was unusable, even though the joint data and the other
+cameras had survived intact.
+
+Now it anchors on the fastest surviving camera instead and records
+`anchor_fallback_from` so the substitution is visible. Only a recording with **no** camera frames
+at all is refused, since there is then no timeline to anchor on.
+
+Related, and worse: the exported HDF5 gave no sign its source was damaged, so a truncated
+recording produced a file indistinguishable from a clean short episode. Exports now carry
+`source_truncated` and a `warning` attribute.
+
+### 3. Write failures and back-pressure shared one counter
+
+"The disk cannot keep up" and "the disk refused the write" call for completely different
+responses, and both incremented `dropped_queue`. An operator watching the dashboard could not
+tell a slow disk from a broken one. Now split into `dropped_queue` and `write_errors`, with the
+latter shown in red on the dashboard when non-zero.
+
+### 4. Two concurrent Start requests both returned success
 
 Eight simultaneous `POST /api/record/start` produced **two** `200`s. Only one recording actually
 began, so no data was harmed, but the loser was told it had started a recording that did not
@@ -958,8 +979,12 @@ the action are one atomic step. Eight concurrent starts now give exactly one 200
 | Motor stops replying mid-recording | Stream continues, that joint marked stale, others unaffected |
 | Truncated, garbage-appended, zero-length frames | Counted in `frames_bad` / `frames_unknown`, never fatal |
 | Disk stalled to 50 samples/sec | Capture held **998 Hz**, queue stayed bounded, 2,313 drops counted |
+| Disk returns ENOSPC mid-recording | Capture held **998 Hz**, 3,064 write errors counted, the episode written so far still readable |
+| 12 s continuous recording | **+0.7 MB** tracemalloc delta, threads returned to baseline |
+| 6 rapid start/stop cycles | 6 distinct episodes, 6 files, no thread growth |
 | Empty / single-sample / duplicate-timestamp episodes | Marked invalid, no crash, no plausible wrong answer |
 | A NaN in one joint | Contained; did not spread to the other 13 |
+| Read-only directory, paths with spaces and symbols | Fails loudly / works respectively |
 | Lifecycle abuse (double start, stop before start, double stop) | All no-ops or `None`, none raise |
 
 One design point that fault injection clarified: samples with nothing behind them come back as
@@ -1043,7 +1068,7 @@ scripts/
 docs/
   01-can-setup.md  Task 1, in full
   dashboard.png    Task 5 screenshot
-tests/             57 tests, incl. fault injection
+tests/             61 tests, incl. fault injection
 ```
 
 ## Licence

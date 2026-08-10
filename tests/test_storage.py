@@ -146,10 +146,30 @@ def test_export_does_not_modify_the_recording(tmp_path):
     assert path.read_bytes() == before
 
 
-def test_export_rejects_an_anchor_that_is_not_in_the_episode(tmp_path):
-    _, path = make_episode(tmp_path, cam_seqs={"ceiling": list(range(5))})
-    with pytest.raises(KeyError, match="anchor"):
-        export_hdf5(path, anchor="zed_head")
+def test_export_falls_back_when_the_anchor_camera_is_missing(tmp_path):
+    """A crashed recording can lose the anchor camera entirely, since its
+    frames may sit in the destroyed tail.
+
+    Refusing to export then would discard a partly good episode over a choice
+    that has an obvious fallback. It anchors on the fastest surviving camera
+    instead, and records the substitution so nobody finds out by accident.
+    """
+    import h5py
+    _, path = make_episode(tmp_path, n_joints=400,
+                           cam_seqs={"ceiling": list(range(20))})
+
+    out = export_hdf5(path, anchor="zed_head")     # zed_head is not present
+    with h5py.File(out, "r") as h:
+        assert h.attrs["align_anchor"] == "ceiling"
+        assert h.attrs["anchor_fallback_from"] == "zed_head"
+
+
+def test_export_refuses_an_episode_with_no_camera_frames_at_all(tmp_path):
+    """With no frames there is no timeline to anchor on, and joint states
+    alone are not an episode. That one has to fail."""
+    _, path = make_episode(tmp_path, n_joints=100, cam_seqs={"zed_head": []})
+    with pytest.raises(ValueError, match="no camera frames"):
+        export_hdf5(path)
 
 
 # ------------------------------------------------------------------ registry
