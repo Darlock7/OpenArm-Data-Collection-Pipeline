@@ -40,11 +40,50 @@ robot learning, and serves them over a REST API with a live dashboard.
 python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
 
-./.venv/bin/python -m pytest tests/ -q          # 13 tests
+./.venv/bin/python -m pytest tests/ -q          # 44 tests
 ./.venv/bin/python scripts/read_joints.py       # live joint state, simulated arm
 ./.venv/bin/python scripts/demo_sync.py         # 5 streams captured and aligned
 ./.venv/bin/uvicorn openarm_pipeline.api.server:app   # API + dashboard on :8000
 ```
+
+---
+
+## Architecture
+
+Five tasks, one pipeline. Data flows left to right and each stage consumes the previous one.
+
+```
+   ARM                    CAPTURE                 STORE              SERVE
+   ───                    ───────                 ─────              ─────
+   14 motors  ─can0/1─▶  CANSource ──┐
+                         assembler   │
+                                     ├──▶ bounded ──▶ MCAP ──┐
+   4 cameras  ────────▶  CameraSource┘     queue      raw    │
+                                                             │
+                                              align() ◀──────┤
+                                                 │           │
+                                                 ▼           ▼
+                                               HDF5      REST API ──▶ dashboard
+                                            training                   live view
+```
+
+Three principles recur at every layer, and they are the actual design:
+
+**1. One seam per data source.** `CANSource` and `CameraSource` each have a simulated and a
+hardware implementation. Nothing downstream can tell which is running. Without this, none of
+tasks 3 to 5 could have been built at all; with it, hardware bring-up is a one-line change and
+the simulator remains the permanent CI fixture, since a robot arm cannot be plugged into a test
+runner.
+
+**2. Record raw, align at read time.** Nothing is resampled during capture. Alignment is a query
+over untouched streams, so the policy is chosen at export and one recording yields several
+training sets. Resampling during capture would bake in one consumer's needs and destroy the
+others irreversibly.
+
+**3. Measure your own error and publish it.** Snapshot spread, per-sample timing error, bias,
+jitter, dropped frames, queue back-pressure. Where a true value is unavailable, the pipeline
+reports a real one plus its uncertainty rather than a synthetic one that hides it. That is what
+makes alignment quality a filterable property of the dataset instead of an assumption.
 
 ---
 
@@ -837,6 +876,47 @@ Exactly the calls the buttons make.
 
 ---
 
+## What I would do next
+
+### First hour with hardware, in order
+
+1. **Verify `MOTOR_SPECS`.** Move one joint to a physically measured angle and check the decoder
+   agrees. This is first because it is the only failure on the list that is completely silent:
+   wrong scaling limits produce smooth, believable, incorrect values with no error. Ten minutes,
+   and it either validates the whole read path or invalidates it.
+2. **Run `canbusload`** and check the ~70 % per-arm estimate that justifies two buses. It is my
+   arithmetic, not OpenArm's, and it is measurable in one command.
+3. **Switch to kernel timestamping.** Frames are currently stamped when Python receives them,
+   which includes driver and scheduling latency. `SO_TIMESTAMPING` stamps on arrival instead.
+   The interesting part is not the fix but the measurement: the difference between the two is
+   exactly the bias this pipeline is built to eliminate, and I would like to know its size.
+4. **Execute `SocketCANSource` for the first time.** I expect its round-robin `recv(timeout=)`
+   loop to be too slow for two buses at 1 kHz and to need `can.Notifier` or `select()` instead.
+   That is flagged in the source rather than guessed at, because I could not benchmark it.
+
+### With more time, in priority order
+
+| | Why |
+|---|---|
+| **Video encoding** instead of raw frames | Fixes the two biggest storage problems at once: 150 MB/s of raw pixels, and the frame duplication the export currently produces. h264/AV1 plus a frame-index-to-timestamp map, which is what LeRobot does with mp4 and parquet |
+| **Direct LeRobot/RLDS export** | The HDF5 layout is already close. Matching the format DeepAware's pipeline actually consumes removes a conversion step from the training side |
+| **Automatic quality gating** | Every episode already carries its bias and jitter. Rejecting recordings above a threshold at ingest is a small addition on top of data that is already there |
+| **A more faithful camera mock** | Exposure-time motion blur and rolling shutter. Right now timestamp jitter is uncorrelated with image content, which flatters the synchroniser |
+| **Multi-machine clock sync** | Everything here assumes one host. Two machines need PTP, and the alignment code would need a clock-domain concept it currently does not have |
+
+### Known limitations, stated plainly
+
+- **Nothing has touched hardware.** Every number in this README came from a simulation.
+- **`MOTOR_SPECS` is unverified** and fails silently if wrong.
+- **Raw image storage does not scale**; see above.
+- **The export duplicates frames** to fill the anchor timeline, roughly 1.8x on a typical episode.
+- **Python is acceptable here only because every thread is I/O bound.** This process observes the
+  bus; it does not close a loop over it. A real 1 kHz controller belongs in C++.
+- **`SocketCANSource` has never been executed.** It is written against documentation, and the
+  places I expect to be wrong are marked in the source.
+
+---
+
 ## Repository layout
 
 ```
@@ -853,12 +933,22 @@ openarm_pipeline/
     source.py      Frame, CameraStream, JointStream; mid-exposure timestamps
     mock.py        four cameras with drift, jitter, drops and startup skew
     sync.py        alignment: nearest / hermite / window_mean, error per sample
+  storage/
+    base.py        the write-path vs read-path argument; EpisodeWriter interface
+    mcap_backend.py  append-only capture format, plus reader
+    export.py      MCAP -> HDF5; where align() runs
+    registry.py    episode listing from sidecars, never opening recordings
+  api/
+    server.py      REST API
+    static/        the dashboard, one file, no build step
+  recorder.py      capture threads, bounded queue, episode lifecycle
 scripts/
   read_joints.py   Task 2 live reader
   demo_sync.py     Task 3 five-stream capture and alignment report
 docs/
   01-can-setup.md  Task 1, in full
-tests/             28 tests
+  dashboard.png    Task 5 screenshot
+tests/             44 tests
 ```
 
 ## Licence
