@@ -781,6 +781,11 @@ this needs h264/AV1 with a frame-index-to-timestamp map. Both gaps are written i
 
 ✅ **Working.** Served at `/` by the same process as the API.
 
+<img src="docs/dashboard.png" alt="Dashboard: live joint states, four camera previews, episode list, recording controls" width="100%">
+
+<div align="center"><sub>Mid-recording. Live joint states at 10 Hz, four camera previews at their real
+relative rates, one completed episode with download links.</sub></div>
+
 ```bash
 ./.venv/bin/uvicorn openarm_pipeline.api.server:app
 #  http://127.0.0.1:8000        dashboard
