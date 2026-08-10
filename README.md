@@ -40,7 +40,7 @@ robot learning, and serves them over a REST API with a live dashboard.
 python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
 
-./.venv/bin/python -m pytest tests/ -q          # 61 tests
+./.venv/bin/python -m pytest tests/ -q          # 62 tests
 ./.venv/bin/python scripts/read_joints.py       # live joint state, simulated arm
 ./.venv/bin/python scripts/demo_sync.py         # 5 streams captured and aligned
 ./.venv/bin/uvicorn openarm_pipeline.api.server:app   # API + dashboard on :8000
@@ -529,6 +529,16 @@ this directly.
 
 Cameras get **nearest frame only**, and the staleness is recorded rather than hidden.
 
+### The ZED is stereo, and is modelled as stereo
+
+The brief lists it as "ZED stereo", so it emits what a ZED SDK emits: **left and right views side
+by side in one frame**, double width. The right eye's marker is offset, which is what disparity
+looks like, and the size of that offset is what depth would be computed from.
+
+Treating it as a mono camera would have left `stereo=True` in the config as decoration and quietly
+dropped half the sensor. Depth itself is not computed here; that is the ZED SDK's job, and this
+pipeline's responsibility is to record what the camera hands over with an honest timestamp on it.
+
 ### A camera frame is an interval, not an instant
 
 A CAN reading is sampled at a moment. An image **integrates light across its whole exposure**, so
@@ -899,6 +909,32 @@ Exactly the calls the buttons make.
 
 ---
 
+## Assumptions
+
+The brief asks for these to be stated clearly, so they are collected here rather than left
+scattered. Each is also marked at the point in the code where it bites.
+
+| # | Assumption | Confidence | If it is wrong |
+|:--:|---|---|---|
+| 1 | **Motor scaling limits** (`P_MAX`, `V_MAX`, `T_MAX`) follow the public MIT/Damiao convention | 🔴 Unverified. No datasheet | Every joint value is wrong, smoothly and silently. **The only failure in the system with no error signal.** First thing I would test on hardware |
+| 2 | **Two messages per motor per control cycle** (one command, one reply) | 🟡 My model, not from their docs | The bus-load figure changes; the conclusion that one bus cannot carry both arms does not |
+| 3 | **~50 µs per CAN FD frame**, giving ~70 % load per arm | 🟡 Estimate | Same as above. `canbusload` settles it in one command |
+| 4 | **Camera frame rates** of 60/30/30/15 fps | 🟡 Assumed | Nothing structural. They were chosen to be mutually non-harmonic so the sync logic is genuinely exercised |
+| 5 | **Motor model per joint**: 8009P at the shoulder, 43-series at forearm and wrist | 🟡 Inferred from torque needs | Wrong scaling on the affected joints, same failure as #1 |
+| 6 | **CAN IDs 0x01–0x07 per arm**, one bus each | 🟡 Convention | Frames land in `frames_unknown` and are counted, so this one fails loudly |
+| 7 | **Frames timestamped mid-exposure** | 🟢 Standard convention | A systematic image-to-joint offset of half an exposure, which is exactly the bias the pipeline is built to expose |
+| 8 | **The ZED delivers left and right side by side** | 🟢 How the SDK presents it | Only affects how the frame is split downstream |
+
+### Simplifications made knowingly
+
+- **Images are stored as raw arrays.** Real deployment needs h264/AV1 with a frame index. Four cameras at full resolution is roughly 150 MB/s.
+- **Synthetic frames render at 1/8 sensor resolution** to keep the demo cheap. Declared resolution is preserved in metadata.
+- **Mock motion is a sum of sinusoids**, not a real demonstration and not a dynamics model. Torque is a gravity-plus-inertia stand-in.
+- **Single host.** Two machines would need PTP and a clock-domain concept the alignment code does not have.
+- **No rolling shutter or motion blur** in the camera model.
+
+---
+
 ## Fault injection: what broke
 
 Every claim above is easy to make and harder to hold. So the system was attacked deliberately:
@@ -971,6 +1007,16 @@ s = recorder.start_recording(...)  # both then call this
 The lock inside `start_recording()` was doing its job on the data and saying nothing about it.
 Fixed by moving the decision inside the lock and returning `None` to the loser, so the answer and
 the action are one atomic step. Eight concurrent starts now give exactly one 200 and seven 409s.
+
+### 5. A live recording looked like a crashed one
+
+Caught while re-taking the dashboard screenshot. The episode being recorded right now has no
+footer and no sidecar yet, so the reader correctly called it incomplete and the list rendered a
+healthy live take as **"0 joint samples · RECOVERED FROM AN INCOMPLETE RECORDING"**.
+
+The crash detection was right; the context was missing. `GET /api/episodes` now excludes the
+episode currently being written, since the control bar already reports it live and it joins the
+list the moment it stops.
 
 ### What held up
 
@@ -1068,7 +1114,7 @@ scripts/
 docs/
   01-can-setup.md  Task 1, in full
   dashboard.png    Task 5 screenshot
-tests/             61 tests, incl. fault injection
+tests/             62 tests, incl. fault injection
 ```
 
 ## Licence

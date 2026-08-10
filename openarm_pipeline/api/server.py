@@ -109,7 +109,8 @@ def get_live() -> dict:
 @app.get("/api/cameras", tags=["recorder"])
 def list_cameras() -> list[dict]:
     return [{"name": c.name, "fps": c.spec.fps, "width": c.spec.width,
-             "height": c.spec.height, "is_mock": c.is_mock}
+             "height": c.spec.height, "stereo": c.spec.stereo,
+             "is_mock": c.is_mock}
             for c in recorder.cameras]
 
 
@@ -153,8 +154,17 @@ def stop_recording() -> dict:
 
 @app.get("/api/episodes", tags=["episodes"])
 def list_episodes() -> list[dict]:
-    """Newest first. Reads sidecar metadata only, never the recordings."""
-    return [ref.summary() for ref in registry.list()]
+    """Finished episodes, newest first. Reads sidecars only, never recordings.
+
+    The episode currently being recorded is excluded. Its file has no footer
+    and no sidecar yet, so the reader correctly identifies it as incomplete and
+    the listing would show a live take as "RECOVERED FROM AN INCOMPLETE
+    RECORDING" with zero samples. That is alarming and wrong: the recording is
+    not damaged, it is unfinished. The control bar already reports it live, and
+    it joins the list the moment it is stopped.
+    """
+    active = recorder.status().episode_id
+    return [ref.summary() for ref in registry.list() if ref.episode_id != active]
 
 
 @app.get("/api/episodes/{episode_id}", tags=["episodes"])

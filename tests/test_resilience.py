@@ -397,3 +397,31 @@ def test_a_truncated_episode_exports_and_says_it_was_truncated(tmp_path):
         assert h["timing/t_s"].shape[0] > 0, "nothing survived the export"
         assert bool(h.attrs["source_truncated"]) is True
         assert "INCOMPLETE" in h.attrs["warning"]
+
+
+# ------------------------------------------------------- stereo
+
+def test_the_zed_actually_emits_a_stereo_pair():
+    """The brief lists it as "ZED stereo".
+
+    A mono image behind a stereo=True flag would be the flag lying, and would
+    silently drop half the sensor.
+    """
+    from openarm_pipeline.cameras.mock import make_mock_cameras
+
+    cams = {c.name: c for c in make_mock_cameras()}
+    zed, wrist = cams["zed_head"], cams["wrist_left"]
+
+    assert zed.spec.stereo is True
+    assert wrist.spec.stereo is False
+
+    stereo_frame = zed._render(0.30)
+    mono_frame = wrist._render(0.30)
+
+    assert stereo_frame.shape[1] == 2 * zed.mono_w, "the ZED frame is not double width"
+    assert mono_frame.shape[1] == wrist.mono_w
+
+    # the two eyes must differ, otherwise it is one image printed twice
+    left = stereo_frame[:, : zed.mono_w]
+    right = stereo_frame[:, zed.mono_w:]
+    assert not np.array_equal(left, right), "both eyes are identical; disparity is missing"

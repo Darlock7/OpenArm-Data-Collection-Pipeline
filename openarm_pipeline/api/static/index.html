@@ -72,9 +72,10 @@ tr.arm-break td{padding-top:9px}
 /* ---- cameras ---- */
 .cams{display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px}
 .cam{border:1px solid var(--line); border-radius:6px; overflow:hidden; background:#0b0f14}
-.cam canvas{width:100%; display:block; image-rendering:pixelated; aspect-ratio:16/9;
+.cam canvas{width:100%; height:auto; display:block; image-rendering:pixelated;
             background:#0b0f14}
-.cam .lbl{padding:6px 9px; font-size:10.5px; display:flex; justify-content:space-between;
+.cam .lbl{padding:6px 9px; font-size:10.5px; display:flex; gap:8px;
+          justify-content:space-between; align-items:baseline; white-space:nowrap;
           border-top:1px solid var(--line); color:var(--cam)}
 .cam .lbl em{font-style:normal; color:var(--dim)}
 
@@ -199,7 +200,7 @@ async function setupCams() {
   $("cams").innerHTML = cams.map(c =>
     `<div class="cam">
        <canvas id="cv-${c.name}" width="160" height="90"></canvas>
-       <div class="lbl"><span>${c.name}</span><em>${c.fps} fps · ${c.width}×${c.height}</em></div>
+       <div class="lbl"><span>${c.name}</span><em>${c.fps} fps${c.stereo ? " · stereo" : ""}</em></div>
      </div>`).join("");
 }
 

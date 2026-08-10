@@ -68,8 +68,16 @@ class MockCamera(CameraSource):
         self.drop_rate = drop_rate
         self.exposure_s = exposure_s if exposure_s is not None else 0.5 / spec.fps
 
-        self.w = max(8, int(spec.width * scale))
         self.h = max(8, int(spec.height * scale))
+        # A ZED is a stereo camera: two lenses, a fixed baseline apart. Its SDK
+        # hands back both views, conventionally as one side-by-side frame of
+        # double width. Modelling it as a mono camera would leave the `stereo`
+        # flag as decoration and quietly drop half the sensor.
+        mono_w = max(8, int(spec.width * scale))
+        self.mono_w = mono_w
+        self.w = mono_w * 2 if spec.stereo else mono_w
+        #: metres between the two lenses. Only meaningful when stereo.
+        self.baseline_m = 0.12 if spec.stereo else 0.0
 
         self._running = False
         self._t0_ns = 0
@@ -109,26 +117,43 @@ class MockCamera(CameraSource):
 
     # -- image ------------------------------------------------------------
 
-    def _render(self, t_s: float) -> np.ndarray:
-        """Cheap synthetic frame with a time-dependent marker.
+    def _render_eye(self, t_s: float, disparity_px: int = 0) -> np.ndarray:
+        """One synthetic view. `disparity_px` shifts the marker for the right eye.
 
         Deliberately not a rendering of the arm. Pretending to simulate what
         the cameras would actually see would be a much larger claim than this
         project can support, and would invite the reader to trust pixels that
         mean nothing.
         """
-        img = np.zeros((self.h, self.w, 3), dtype=np.uint8)
+        w = self.mono_w
+        img = np.zeros((self.h, w, 3), dtype=np.uint8)
 
         # static gradient so each camera looks distinct from the others
-        img[:, :, 0] = np.linspace(20, 90, self.w, dtype=np.uint8)[None, :]
+        img[:, :, 0] = np.linspace(20, 90, w, dtype=np.uint8)[None, :]
         img[:, :, 1] = np.linspace(20, 70, self.h, dtype=np.uint8)[:, None]
 
         # marker sweeping left to right once per second -- alignment across
         # cameras is checkable by eye from where this sits in each frame
-        x = int((t_s % 1.0) * (self.w - 1))
+        x = int((t_s % 1.0) * (w - 1)) - disparity_px
         y = self.h // 2
-        img[max(0, y - 2):y + 3, max(0, x - 2):x + 3, 2] = 255
+        if 0 <= x < w:
+            img[max(0, y - 2):y + 3, max(0, x - 2):min(w, x + 3), 2] = 255
         return img
+
+    def _render(self, t_s: float) -> np.ndarray:
+        """A frame. For a stereo camera, both eyes side by side.
+
+        The right eye's marker is shifted by a few pixels, which is what
+        disparity looks like: the same point in the world lands at different
+        horizontal positions in the two views, and the size of that shift is
+        what depth is computed from. Small detail, but a mono image with a
+        `stereo=True` flag on it would be a lie.
+        """
+        if not self.spec.stereo:
+            return self._render_eye(t_s)
+        left = self._render_eye(t_s, disparity_px=0)
+        right = self._render_eye(t_s, disparity_px=max(2, self.mono_w // 20))
+        return np.concatenate([left, right], axis=1)
 
     # -- capture -----------------------------------------------------------
 
