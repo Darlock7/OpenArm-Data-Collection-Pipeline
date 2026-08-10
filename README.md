@@ -18,7 +18,7 @@ robot learning, and serves them over a REST API with a live dashboard.
 |:--:|---|:--|---|
 | 1 | **CAN interface setup** | 📝 **Documented, not run** | No hardware. Full reasoning below |
 | 2 | **CAN data reading** | ✅ **Working** | 995.8 Hz sustained against a simulated arm |
-| 3 | Multi-camera synchronisation | ⬜ Not started | |
+| 3 | **Multi-camera synchronisation** | ✅ **Working** | 5 streams aligned, timing error measured per sample |
 | 4 | Storage backend + REST API | ⬜ Not started | |
 | 5 | Monitoring dashboard | ⬜ Not started | |
 
@@ -42,6 +42,7 @@ python3 -m venv .venv
 
 ./.venv/bin/python -m pytest tests/ -q          # 13 tests
 ./.venv/bin/python scripts/read_joints.py       # live joint state, simulated arm
+./.venv/bin/python scripts/demo_sync.py         # 5 streams captured and aligned
 ```
 
 ---
@@ -426,9 +427,190 @@ demonstration six months later.
 
 ---
 
-## Tasks 3–5
+## Task 3 - multi-camera synchronisation
+
+> *"Capture (or simulate) synchronized frames from all 4 cameras. Describe how you handle frame
+> timestamps and alignment with joint state data. How do you deal with cameras running at
+> different frame rates?"*
+
+✅ **Working.** Four simulated cameras at 60/30/30/15 fps captured concurrently with the 1 kHz
+joint stream, then aligned on a common timeline with the timing error recorded per sample.
+
+### The problem, drawn
+
+```
+  joints 1kHz  |||||||||||||||||||||||||||||||||||||||||||||||||||||||||||
+  wrist_left           o           o            o           o
+  wrist_right            o            o          o            o
+  ceiling             o                       o
+  zed_head            o      o     o    o      o     o    o      o
+               0 ms                                               200 ms
+```
+
+Five streams, none ticking together, none sharing a clock. A training sample needs an image and
+a joint state describing **the same moment**, and no such pair exists in the raw data. Worse,
+the ceiling camera is blind for 66 ms at a stretch, during which a joint moving at 2 rad/s
+travels **7.6 degrees**.
+
+### The rule everything follows
+
+> **Do not resample at record time. Store raw, align at read time.**
+
+At capture time you do not yet know what the training code will want. One method wants a sample
+per ZED frame with interpolated joints; another wants raw 1 kHz torque for contact detection; a
+third wants a fixed 30 Hz grid. Resampling during capture bakes one of those in and destroys the
+others **irreversibly**.
+
+So `sync.py` mutates nothing. Alignment is a *query*: hand it a timeline, get a view. Ask again
+with a different policy and you get a different view of the same untouched data. A test asserts
+this directly.
+
+### Joints interpolate. Pixels never do.
+
+| Signal | Interpolate? | Why |
+|---|:--:|---|
+| Joint **position** | ✅ Cubic Hermite | Continuous physical signal, a joint cannot teleport. The motor already reports **velocity**, which is the derivative, so the curve can leave each sample at the slope actually measured there. Strictly better than linear and free |
+| Joint **torque** | ⚠️ Linear, with suspicion | Near discontinuous at contact, and contact is usually the most important moment in a demonstration. Interpolating across one invents a ramp where reality had a step |
+| **Camera frames** | ❌ Never | Blending two images makes a translucent ghost of a scene that never existed. A vision policy trained on manufactured frames learns to expect artifacts the real camera will never produce |
+
+Cameras get **nearest frame only**, and the staleness is recorded rather than hidden.
+
+### A camera frame is an interval, not an instant
+
+A CAN reading is sampled at a moment. An image **integrates light across its whole exposure**, so
+1/60 s of world is smeared into one array. "When was this frame taken" has no exact answer.
+
+Frames are stamped at **mid-exposure**, the centre of mass of the light that formed the image.
+Stamping at start of exposure biases every frame early by half the exposure; stamping at readout
+biases late by an exposure plus transfer. Either produces a systematic image-to-joint offset,
+which is the single most damaging error in this pipeline. `Frame.exposure_s` travels alongside
+so a consumer can see how wide the interval was instead of assuming.
+
+### What is actually being defended against
+
+Ranked by how badly each damages a trained policy:
+
+| | Failure | Why it ranks there |
+|:--:|---|---|
+| **1** | **Bias** - a systematic image-to-joint offset | The policy learns to act on stale observations, then lags and overshoots on hardware. Bias does not average out with more data. It is *learned* |
+| **2** | **Jitter** - an offset that varies | Worse per millisecond than bias. A constant offset can be partly absorbed into the learned dynamics; a wandering one cannot |
+| **3** | **Aliasing** - decimating 1 kHz data without filtering | Content above the new Nyquist folds down and stops looking like noise, starts looking like real motion that never happened |
+
+Every aligned sample therefore carries its **signed** timing error, `dt = t_sample - t_query`.
+Signed, not absolute, because the mean of the signed error *is* the bias. Take absolute values
+first and a 50 ms systematic offset averages to +50 and becomes indistinguishable from a 50 ms
+lead. That is exactly how a fatal misalignment ships undetected.
+
+`window_mean` exists for failure 3: a boxcar average is a crude low-pass filter, and crude and
+applied beats ideal and skipped.
+
+### Anchoring on a camera, not a grid
+
+The timeline that training samples sit on is **the primary camera's real frame timestamps**.
+
+In imitation learning the observation *is* an image, and at inference the policy runs when a
+frame arrives. Anchoring on real frame times means every training sample corresponds to a moment
+the robot will actually experience, and the anchor camera needs no interpolation at all. **Its
+error is identically zero by construction.**
+
+A fixed grid would buy independence from any one sensor at the cost of making every sample in
+every stream synthetic. `align()` accepts any timeline, so that remains available; it is simply
+not the default.
+
+### Results
+
+```console
+$ python scripts/demo_sync.py --duration 5
+
+  stream          samples   nominal   measured  dropped     drift
+  ---------------------------------------------------------------
+  joints             4968   1000 Hz      993.0
+  wrist_left          150       30 f      29.79        1      -61p
+  wrist_right         150       30 f      29.80        1      -18p
+  ceiling              76       15 f      15.00        0      -90p
+  zed_head            300       60 f      59.99        0      117p
+
+  alignment  anchor=zed_head  policy=hermite  300 samples
+  stream              bias    jitter     worst   usable
+  -----------------------------------------------------
+  joints           -0.001m    0.356m    1.990m    99.7%
+  wrist_left       -5.414m    8.509m   16.702m    99.3%
+  wrist_right      -0.443m    8.489m   11.624m    99.3%
+  ceiling           3.385m   19.001m   33.213m    96.7%
+  zed_head          0.000m    0.000m    0.000m   100.0%   <- anchor
+```
+
+Three things worth reading off that table:
+
+- **The anchor is exactly 0.000**, not approximately. Every sample sits on a real frame.
+- **The ceiling camera's worst case is 33.2 ms**, which is precisely half a frame at 15 fps. Not
+  a bug, a floor. It is reported rather than hidden.
+- **Bias and jitter are separate columns.** `wrist_left` carries a systematic -5.4 ms offset
+  *and* 8.5 ms of jitter. Different problems, different fixes, and a single "mean absolute
+  error" column would have concealed both.
+
+A slow camera is also not punished for being slow: the acceptance tolerance scales with each
+camera's own measured rate. Holding a 15 fps ceiling camera to the same millisecond budget as a
+60 fps ZED would reject nearly all of its frames for doing nothing wrong.
+
+### Scoring the policies against ground truth
+
+The simulated arm is an analytic function of time, so its **true** position at any instant is
+known. That turns "hermite should be better" into a measurement:
+
+```console
+  policy          synthetic     mean err    worst err
+  ---------------------------------------------------
+  nearest                no      0.6039m      4.6917m
+  hermite               yes      0.5509m      3.9041m   <- best
+  window_mean           yes      0.5878m     10.2253m
+```
+
+Millirad against truth. Hermite wins on both mean and worst case. `window_mean` has the worst
+peak error because smoothing clips extremes, which is the trade it exists to make.
+
+**The margin is only 9%, and that deserves an explanation rather than a victory lap.** At 1 kHz
+the joints are roughly 50x oversampled relative to human motion, so the residual is dominated by
+**timestamp jitter**, not interpolation error, and no method recovers what the clock got wrong.
+The choice matters far more at lower rates: `tests/test_sync.py` shows hermite beating linear by
+**5x** on a signal sampled every 20 ms.
+
+<details>
+<summary><b>What the simulated cameras model, and why each imperfection is there</b></summary>
+
+<br>
+
+A mock producing perfectly regular frames would make the synchroniser look flawless and prove
+nothing. Each modelled defect breaks a different naive assumption:
+
+| Modelled | Breaks the assumption that |
+|---|---|
+| **Jitter**, ~1.5 ms | frame N happened at N/fps |
+| **Clock drift**, randomised per camera to ±120 ppm | the offset measured at startup stays valid. At 30 fps over 60 s, 120 ppm is nearly two full frames of accumulated error |
+| **Dropped frames**, 0.2% | frame index is time. This is why `Frame` carries a sequence number: a gap in `seq` is visible, a gap in a Python list is not |
+| **Startup skew**, 0 to 40 ms | stream 0 sample 0 lines up with stream 1 sample 0 |
+
+Together these are the reason alignment must be timestamp-based rather than index-based, which
+is the whole of Task 3.
+
+**Not modelled:** rolling shutter, real image content, compression, USB bandwidth contention. The
+frames carry a synthetic pattern with a marker that sweeps once per second, so cross-camera
+alignment is checkable by eye. Images render at a fraction of the declared sensor resolution to
+keep the demo cheap; the declared resolution is preserved in metadata. That is a simulation
+shortcut, not a claim about the real cameras.
+
+</details>
+
+---
+
+## Tasks 4-5
 
 Not yet started. Sections to follow.
+
+> **Note for Task 4:** the Robotics Center wiki describes their data collection as using
+> **RLDS / LeRobot** format. That is worth weighing seriously against a generic HDF5 versus MCAP
+> argument, since matching the format the consuming pipeline already speaks is a stronger answer
+> than picking a defensible one in isolation.
 
 ---
 
@@ -444,11 +626,16 @@ openarm_pipeline/
     mock.py        simulated arm
     socketcan.py   real hardware path (untested)
     assembler.py   individual motor frames -> whole-arm snapshots
+  cameras/
+    source.py      Frame, CameraStream, JointStream; mid-exposure timestamps
+    mock.py        four cameras with drift, jitter, drops and startup skew
+    sync.py        alignment: nearest / hermite / window_mean, error per sample
 scripts/
   read_joints.py   Task 2 live reader
+  demo_sync.py     Task 3 five-stream capture and alignment report
 docs/
   01-can-setup.md  Task 1, in full
-tests/
+tests/             28 tests
 ```
 
 ## Licence
