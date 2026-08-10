@@ -233,10 +233,145 @@ grounding, every flag, the complete failure table, and references.
 
 ---
 
-## Task 2 — CAN data reading
+## Task 2 - CAN data reading
 
-✅ **Working.** Joint position, velocity and torque for all 14 joints, decoded from real Damiao
-MIT-mode frames produced by a simulated arm.
+> *"Read live joint position, velocity, and torque from the arm over CAN FD. If you don't have
+> hardware access, mock the CAN data stream in software and note that clearly."*
+
+✅ **Working.** All 14 joints, decoded from genuine Damiao MIT-mode frames produced by a
+simulated arm, sustained at **995.8 Hz** against the 1 kHz target.
+
+### The decision that shapes everything: where to fake
+
+With no arm, you are writing a simulation. The question is *at which layer*, and it is the only
+choice here that is hard to reverse.
+
+```
+  OPTION A  (rejected)                 OPTION B  (chosen)
+
+  fake ──▶ position = 0.34             fake ──▶ 0x04 0x90 0x15 0x88 ...
+           velocity = 1.20                            │
+           torque   = 2.44                            ▼
+                                              REAL decoder runs
+                                                      │
+                                                      ▼
+                                              position = 0.34
+```
+
+**Option A produces a demo that proves nothing.** The decoder, which is the actual hard part,
+never executes. You would have tested your imagination.
+
+**Option B means every frame in the simulation is real Damiao format, parsed by the real
+parser.** The bit-unpacking, the scaling, the error handling and the frame assembler are all
+exercised on every run. Attach hardware and none of that code path changes.
+
+The cost is that the mock has to know the wire format, which is more work. Worth it: it is the
+difference between a stub and a test fixture the pipeline can be regression-tested against
+permanently, since CI cannot plug in a robot arm.
+
+### What is actually in a frame
+
+Eight bytes carry position, velocity, torque, two temperatures, the motor ID and an error code,
+a thousand times a second. There is no room for anything readable.
+
+```
+ byte   0      1      2      3      4      5      6      7
+      ┌─────┬─────────────┬─────┬─────┬─────┬─────┬─────┐
+      │ ID  │  POSITION   │ VEL │ V|T │ TRQ │Tmos │Trot │
+      │+err │   16 bit    │     │     │     │     │     │
+      └─────┴─────────────┴─────┴─────┴─────┴─────┴─────┘
+                                  ▲
+                     byte 4 is SHARED: high nibble finishes
+                     velocity, low nibble starts torque
+```
+
+That shared byte is where a hand-written parser goes wrong, so
+[`tests/test_protocol.py`](tests/test_protocol.py) attacks it directly: drive velocity to its
+maximum while holding torque at its minimum, then reverse the pairing. A swapped nibble cannot
+pass both.
+
+### The values are integers, and that has consequences
+
+A motor does not transmit `0.34 radians`. It transmits an integer, and both ends must already
+agree what range it spans. Two consequences:
+
+**Resolution differs per field.** Position gets 16 bits, velocity and torque only 12:
+
+```console
+sent:     pos 1.5708 rad    vel 2.0 rad/s     torque 1.25 Nm
+decoded:  pos 1.5707 rad    vel 2.0000 rad/s  torque 1.2479 Nm
+          └─ 16 bit, ~0.0004 rad ─┘           └─ 12 bit, ~0.005 Nm ─┘
+```
+
+Torque resolves to roughly 4,000 steps across its full range, not 65,000. Worth knowing before
+trusting a torque figure to three decimals.
+
+**And the scaling constants are the silent failure mode** described in Task 1: wrong limits give
+smooth, believable, incorrect values with no error at all.
+
+### There is no such thing as "the arm right now"
+
+The most interesting thing I learned building this. Downstream code wants a snapshot: 14
+positions at one instant. **The bus cannot provide that.** Each motor answers separately,
+microseconds apart, so a snapshot is a *reconstruction*, and every reconstruction makes choices.
+
+| Question | Options | Chosen | Why |
+|---|---|---|---|
+| A joint missed this cycle | stall / carry forward | **carry forward, mark `valid=False`** | one dead motor should degrade a recording, not end it |
+| Readings span real time | present as instantaneous / measure it | **measure it, publish `spread_s`** | the dataset should carry evidence of its own precision |
+| Which timestamp to use | average them / newest reading | **newest** | an average is a number no sensor ever produced |
+
+That last row is a small decision with a large principle behind it: **when you cannot have the
+true value, report a real one plus its error, never a synthetic one that hides it.**
+
+Measured spread is **0.32 ms**. For scale, a joint moving at 2 rad/s travels 0.00064 rad in that
+window, which is about 1.7 least-significant bits of position resolution. Comparable to
+quantisation noise, so interpolating within a snapshot would be false precision.
+
+<details>
+<summary><b>Why interpolate at all, and where it stops being valid</b></summary>
+
+<br>
+
+The same question returns much larger in Task 3, where camera frames sit tens of milliseconds
+apart rather than fractions of one. The answer splits by signal type:
+
+| | Interpolate? | Reason |
+|---|:--:|---|
+| Joint position | ✅ | Continuous physical signal. A joint cannot teleport. Better still, the motor reports velocity too, so cubic Hermite interpolation is available for free and beats linear |
+| Joint torque | ⚠️ | Not smooth. Contact events are near discontinuous, and interpolating across one invents a gentle ramp where reality had a step |
+| Camera frames | ❌ | Blending two images produces a ghost of something that never existed. Training a vision policy on manufactured frames teaches it artifacts the real camera never produces |
+
+Scale of the problem, joint at 2 rad/s:
+
+```
+  snapshot spread   0.32 ms  ->  0.037 deg of arm movement   negligible
+  ceiling camera    66.7 ms  ->  7.6 deg of arm movement     enormous
+```
+
+Which drives the Task 3 architecture: **do not resample at record time.** At record time you do
+not yet know what the training code will want, and discarding raw samples makes that choice
+permanent. Store native rates with honest timestamps; align at read time under a declared
+policy; mark anything interpolated as interpolated.
+
+</details>
+
+### Proving it works with no arm to compare against
+
+What cannot be proven without hardware: that the decoder matches a real Damiao motor. That
+requires moving a joint to a measured angle and checking agreement.
+
+What can be proven, and is: the decoder is self-consistent, handles the split byte correctly,
+saturates instead of wrapping on overflow, and rejects malformed frames rather than guessing.
+**13 tests, named so the intent reads without opening them.**
+
+```console
+$ python -m pytest tests/ -q
+.............                                                    [100%]
+13 passed in 0.01s
+```
+
+### Results
 
 ```console
 $ python scripts/read_joints.py --duration 3
@@ -257,11 +392,37 @@ $ python scripts/read_joints.py --duration 3
 | Measured over 3 s | |
 |---|---|
 | Sustained rate | **995.8 Hz** against a 1 kHz target |
-| Frames decoded | 41,807 — **0 bad, 0 unknown** |
+| Frames decoded | 41,807, with **0 bad and 0 unknown** |
+| Frames dropped | 26 (0.06%), injected deliberately |
 | Snapshot spread | 0.32 ms |
-| Tests | 13 passing |
 
-*(This section will be expanded — architecture and design decisions still to be written up.)*
+<details>
+<summary><b>What the simulated arm does and does not model</b></summary>
+
+<br>
+
+**Faithful:**
+
+- Frames are real Damiao MIT-mode bytes, produced by `encode_feedback` and parsed by the same
+  decoder the hardware path uses
+- Motors are polled round robin, one frame each, as on a real bus. A snapshot is never atomic
+- 0.1% of frames are dropped and timing jitter is injected, so the `valid` mask and the spread
+  measurement are actually exercised rather than sitting untested
+- Seeded, so runs are reproducible
+
+**Not faithful:**
+
+- Motion is two sine waves per joint, chosen because it is smooth and analytically
+  differentiable, so velocity is exact rather than estimated. It is not a real teleoperation
+  demonstration
+- Torque is a gravity plus inertia stand-in, not this arm's dynamics
+- No bus arbitration, electrical faults, or controller latency
+
+Every episode recorded from this source is tagged `is_mock=True` in metadata and in its
+filename, and the reader prints a banner. Synthetic data must never be mistakable for a real
+demonstration six months later.
+
+</details>
 
 ---
 
