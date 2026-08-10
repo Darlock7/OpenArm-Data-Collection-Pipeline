@@ -2,7 +2,7 @@
 
 **Status: not performed. No hardware.**
 
-I had no OpenArm, no CAN adapter, and no Linux machine. `openarm-can-cli can_configure`
+I had no OpenArm, no CAN adapter, and no Linux machine. `openarm-can-cli`
 and the zero-position tare write to physical motors, so there is nothing I could have
 produced here except a fabricated screenshot.
 
@@ -65,28 +65,39 @@ That is the constraint that forces `can0` and `can1` to exist.
 SocketCAN presents a CAN adapter as an ordinary Linux network interface, so it is
 configured with `ip link`, the same tool used for ethernet.
 
-```bash
-# Must be DOWN before its parameters can be changed.
-sudo ip link set can0 down
+The OpenArm guide gives this directly:
 
+```bash
+# From docs.openarm.dev/software/setup/can-setup/ -- CAN FD at 5 Mbps
+sudo ip link set can0 down
+sudo ip link set can0 type can bitrate 1000000 dbitrate 5000000 fd on
+sudo ip link set can0 up
+```
+
+Then identically for `can1`. A helper script wraps the same thing:
+
+```bash
+openarm-can-configure-socketcan can0 -fd
+```
+
+I would add two things their guide does **not** include. Marking them as mine rather than
+theirs, because that distinction is the whole point of this document:
+
+```bash
 sudo ip link set can0 type can \
      bitrate  1000000  sample-point  0.75 \
      dbitrate 5000000  dsample-point 0.75 \
      fd on
-
 sudo ip link set can0 txqueuelen 1000
-sudo ip link set can0 up
 ```
-
-Then identically for `can1`.
 
 | Flag | Why |
 |---|---|
 | `bitrate 1000000` | Arbitration phase. Every node must agree, and this phase is where bus arbitration happens, so it stays slow and robust. |
 | `dbitrate 5000000` | Data phase — the 5 Mbit/s from the brief. CAN FD's core trick: once a node has won arbitration nobody else is competing, so the payload can be clocked much faster. |
 | `fd on` | Enables CAN FD. Without it the controller stays in classic mode: 8-byte payloads, no data-phase switch. |
-| `sample-point 0.75` | Where in each bit the controller samples. 0.75 is the CiA-recommended value at these rates; it trades noise margin against tolerance for clock mismatch between nodes. |
-| `txqueuelen 1000` | Kernel-side transmit buffer. The default of 10 is sized for a low-rate bus and will drop outbound frames at 1 kHz across 7 motors. |
+| `sample-point 0.75` | **My addition, not in the OpenArm guide.** Where in each bit the controller samples. 0.75 is the CiA-recommended value at these rates; it trades noise margin against tolerance for clock mismatch between nodes. |
+| `txqueuelen 1000` | **My addition, not in the OpenArm guide.** Kernel-side transmit buffer. The default of 10 is sized for a low-rate bus and will drop outbound frames at 1 kHz across 7 motors. |
 
 Two deliberate omissions:
 
@@ -146,7 +157,7 @@ canbusload can0@1000000 -r -t  # measured load, to check the ~35 % estimate abov
 ### What it is
 
 The Damiao motors are quasi-direct-drive, so the arm is backdrivable and gets moved by
-hand. Each motor's encoder reports an angle against an internal reference that has no
+hand during teleoperation. Each motor's encoder reports an angle against an internal reference that has no
 relationship to the arm's geometry. Zeroing declares the **current physical pose** to be
 0 rad on every joint.
 
@@ -157,22 +168,29 @@ one session's data is being fed a different coordinate frame at inference time.
 ### Procedure
 
 ```bash
-openarm-can-cli can_configure --interface can0
-openarm-can-cli can_configure --interface can1
+openarm-can-cli -i can0 can_configure
+openarm-can-cli -i can1 can_configure
+
+# Classic CAN at 1 Mbps instead, if needed:
+openarm-can-cli -i can0 can_configure -d 1000000 --no-fd
 ```
 
-**[UNVERIFIED — exact flags are from the task brief; I could not confirm the CLI's
-argument names without the tool installed.]**
+Note the interface flag is `-i` and it precedes the subcommand.
 
-Physically, before running it:
+Physically, the arm does not get posed by hand for this. It goes into a **purpose-built
+calibration jig**. Per the OpenArm calibration workflow:
 
 1. Power the motors but leave them disabled, so the arm is free to move.
-2. Move both arms into the documented home pose against their mechanical hard stops —
-   OpenArm 2.0 has stops on every axis, which is what makes the pose repeatable rather
-   than eyeballed.
-3. Support the arms. A QDD arm has almost no gearbox friction and will fall under its own
-   weight the instant it is released.
+2. Press the arm pipe into the recess of the jig, seat the trigger's flat surface against
+   the jig's flat surface, press the body against the jig and secure it firmly, then fasten
+   with two 12 mm M2 screws. Mirror for the other arm.
+3. Support the arms throughout. A QDD arm has almost no gearbox friction and will fall
+   under its own weight the instant it is released.
 4. Zero, then enable and confirm every joint reads ~0.
+
+The jig is the whole point: it makes the reference pose repeatable **to a machined surface**
+rather than to someone's judgement, which is what lets two sessions share a coordinate
+frame. OpenArm's setup guide budgets roughly 45 minutes for calibration and homing.
 
 ### What it does on the wire
 
@@ -242,6 +260,10 @@ Since none of the above could be executed, `openarm_pipeline/can/`:
 
 ## References
 
+- [OpenArm CAN setup guide](https://docs.openarm.dev/software/setup/can-setup/) -- source for the
+  `ip link` and `openarm-can-cli` commands above
+- [OpenArm zero position calibration workflow](https://docs.openarm.dev/hardware/openarm-ker/calibration-workflow)
+- [enactic/openarm_can](https://github.com/enactic/openarm_can) -- the official CAN control library
 - [OpenArm documentation](https://docs.openarm.dev)
 - [SVRC OpenArm 101 setup guide](https://www.roboticscenter.ai/en/hardware/openarm/setup)
 - [SVRC Damiao motor reference](https://www.roboticscenter.ai/wiki/damiao-motors)

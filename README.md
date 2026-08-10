@@ -90,18 +90,18 @@ SocketCAN presents a CAN adapter as an ordinary Linux network interface, so it i
 with `ip link` — the same tool used for ethernet.
 
 ```bash
-sudo ip link set can0 down                     # must be down to change parameters
-
-sudo ip link set can0 type can \
-     bitrate  1000000  sample-point  0.75 \    # arbitration phase
-     dbitrate 5000000  dsample-point 0.75 \    # data phase — the 5 Mbit/s from the brief
-     fd on                                     # without this it falls back to classic CAN
-
-sudo ip link set can0 txqueuelen 1000          # default of 10 drops frames at 1 kHz
+# docs.openarm.dev/software/setup/can-setup/
+sudo ip link set can0 down                                               # must be down to change parameters
+sudo ip link set can0 type can bitrate 1000000 dbitrate 5000000 fd on    # 1 Mbit arbitration, 5 Mbit data, FD on
 sudo ip link set can0 up
+
+openarm-can-cli -i can0 can_configure                                    # then the zero-position tare
 ```
 
-Then identically for `can1`.
+Then identically for `can1`. Note `-i` precedes the subcommand.
+
+On top of the documented command I would add `sample-point 0.75`, `dsample-point 0.75` and
+`txqueuelen 1000`. **Those three are mine, not OpenArm's** — reasoning in the fold below.
 
 <details>
 <summary><b>Why each flag is there, and two deliberate omissions</b></summary>
@@ -113,8 +113,8 @@ Then identically for `can1`.
 | `bitrate 1000000` | Arbitration phase. Every node must agree on it, and it is where bus arbitration happens, so it stays slow and robust. |
 | `dbitrate 5000000` | Data phase. CAN FD's core trick: once a node has won arbitration nobody is competing, so the payload can clock much faster. |
 | `fd on` | Enables CAN FD. Without it the controller stays in classic mode — 8-byte payloads, no data-phase switch. |
-| `sample-point 0.75` | Where in each bit the controller samples. The CiA-recommended value at these rates; trades noise margin against tolerance for clock mismatch between nodes. |
-| `txqueuelen 1000` | Kernel transmit buffer. The default of 10 is sized for a low-rate bus and will drop outbound frames at 1 kHz across 7 motors. |
+| `sample-point 0.75` | **Mine, not in the OpenArm guide.** Where in each bit the controller samples. The CiA-recommended value at these rates; trades noise margin against tolerance for clock mismatch between nodes. |
+| `txqueuelen 1000` | **Mine, not in the OpenArm guide.** Kernel transmit buffer. The default of 10 is sized for a low-rate bus and will drop outbound frames at 1 kHz across 7 motors. |
 
 **No `restart-ms`.** Automatic bus-off recovery sounds helpful and is wrong for a data recorder.
 A bus-off event means the recording is already compromised, and silently recovering hides that
@@ -158,6 +158,12 @@ geometry. Zeroing declares the **current physical pose** to be 0 rad on every jo
 It is the same operation as taring a scale, and it matters for the same reason: without it,
 "joint 4 at 0.5 rad" means something different every session, and a policy trained on Monday's
 data is handed a different coordinate frame on Tuesday.
+
+The arm is not posed by hand for this. It goes into a **purpose-built calibration jig** — press
+the arm pipe into the jig recess, seat the trigger flat against the jig face, clamp the body,
+fasten with two 12 mm M2 screws, then mirror on the other side. That is the point of the jig:
+the reference pose is repeatable to a machined surface rather than to someone's judgement.
+OpenArm budgets roughly 45 minutes for calibration and homing.
 
 Underneath the CLI, zeroing is one reserved 8-byte payload sent to each motor ID:
 
@@ -217,6 +223,10 @@ agrees. Ten minutes, and it either validates the whole read path or invalidates 
 - [`SocketCANSource`](openarm_pipeline/can/socketcan.py) written in full against the SocketCAN and
   python-can docs, clearly marked untested, with the places I expect to be wrong called out in
   comments
+
+**Sources:** [CAN setup guide](https://docs.openarm.dev/software/setup/can-setup/) ·
+[calibration workflow](https://docs.openarm.dev/hardware/openarm-ker/calibration-workflow) ·
+[enactic/openarm_can](https://github.com/enactic/openarm_can)
 
 📄 **Full detail:** [`docs/01-can-setup.md`](docs/01-can-setup.md) — physical layer, termination and
 grounding, every flag, the complete failure table, and references.
