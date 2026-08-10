@@ -19,7 +19,7 @@ robot learning, and serves them over a REST API with a live dashboard.
 | 1 | **CAN interface setup** | 📝 **Documented, not run** | No hardware. Full reasoning below |
 | 2 | **CAN data reading** | ✅ **Working** | 995.8 Hz sustained against a simulated arm |
 | 3 | **Multi-camera synchronisation** | ✅ **Working** | 5 streams aligned, timing error measured per sample |
-| 4 | Storage backend + REST API | ⬜ Not started | |
+| 4 | **Storage backend + REST API** | ✅ **Working** | MCAP capture, HDF5 export, 8 endpoints |
 | 5 | Monitoring dashboard | ⬜ Not started | |
 
 > ### ⚠️ Read this first
@@ -43,6 +43,7 @@ python3 -m venv .venv
 ./.venv/bin/python -m pytest tests/ -q          # 13 tests
 ./.venv/bin/python scripts/read_joints.py       # live joint state, simulated arm
 ./.venv/bin/python scripts/demo_sync.py         # 5 streams captured and aligned
+./.venv/bin/uvicorn openarm_pipeline.api.server:app   # API + dashboard on :8000
 ```
 
 ---
@@ -603,14 +604,179 @@ shortcut, not a claim about the real cameras.
 
 ---
 
-## Tasks 4-5
+## Task 4 - storage backend and REST API
 
-Not yet started. Sections to follow.
+> *"Store episodes (joint states + camera frames) in a structured format. Choose a storage format
+> and justify your choice (e.g. HDF5, MCAP, zarr, custom). Include a simple REST API to list
+> episodes, retrieve metadata, and download an episode."*
 
-> **Note for Task 4:** the Robotics Center wiki describes their data collection as using
-> **RLDS / LeRobot** format. That is worth weighing seriously against a generic HDF5 versus MCAP
-> argument, since matching the format the consuming pipeline already speaks is a stronger answer
-> than picking a defensible one in isolation.
+✅ **Working.** MCAP for capture, HDF5 for training, eight REST endpoints.
+
+### The question contains an assumption worth rejecting
+
+"Choose a storage format" assumes one format should serve both writing and reading. Those jobs
+want opposite things:
+
+| | While **recording** | While **training** |
+|---|---|---|
+| Access pattern | Append, one sample at a time | Random access to shuffled timesteps |
+| Length | Unknown until you stop | Fixed and known |
+| Rates | Five streams, all different, none resampled | One common timeline |
+| Biggest risk | Power dies mid-episode | Dataloader starves the GPU |
+| Therefore wants | Append-only, crash tolerant | Chunked, compressed, indexed |
+
+Scored against that split:
+
+| | MCAP | HDF5 | Zarr | LeRobot/RLDS |
+|---|:--:|:--:|:--:|:--:|
+| Append during capture | ✅ built for it | ❌ writer lock | 🟡 | ❌ export target |
+| Survives a crash mid-write | ✅ truncated file still reads | ❌ can lose the file | 🟡 per chunk | n/a |
+| Native heterogeneous rates | ✅ per-message timestamps | 🟡 parallel datasets | 🟡 | 🟡 fixed steps |
+| Random access for training | ❌ it is a log | ✅ | ✅ | ✅ |
+| Ecosystem | ROS 2, Foxglove | ALOHA/ACT | Diffusion Policy | **DeepAware's own pipeline** |
+
+### So: record to MCAP, export to HDF5
+
+```
+   capture ──▶ MCAP           raw, native rates, nothing resampled
+                 │
+                 │  ◀── align() runs HERE
+                 ▼
+              HDF5            one timeline, dataloader ready
+```
+
+**This is Task 3's rule made physical.** "Store raw, align at read time" becomes "the alignment
+policy is an argument to the export", which means one recording produces several training sets:
+
+```bash
+POST /api/episodes/{id}/export?policy=hermite       # interpolated joints
+POST /api/episodes/{id}/export?policy=nearest       # only real measurements
+POST /api/episodes/{id}/export?policy=window_mean   # anti-aliased
+```
+
+A test asserts the MCAP is **byte-identical** after all three. Disagree with a choice a year from
+now and you re-export rather than re-record.
+
+It also places RLDS/LeRobot correctly. It is the **export target**, not the recording format:
+matching what the consuming pipeline speaks, without crippling capture to do it.
+
+<details>
+<summary><b>Why MCAP specifically, and what it costs</b></summary>
+
+<br>
+
+Recording is the one moment in this pipeline where data is irreplaceable. A training export can
+be regenerated; a demonstration cannot be re-performed. So the write format is chosen for
+survival first:
+
+- **A file truncated by a crash is still readable** up to the last complete message. HDF5 can
+  lose the entire file to one bad write.
+- **Per-message timestamps on independent channels**, so five streams at five rates need no
+  resampling, no padding, and no common clock at write time. The format stops fighting the Task 3
+  design and starts enabling it.
+- **ROS 2 and Foxglove standard**, so recordings open in existing tooling.
+
+Costs, taken deliberately: joint states are stored as JSON with a registered schema, roughly 1 KB
+per message at 1 kHz. Wasteful, and worth it on a research rig where opening a file and reading
+it beats saving a megabyte a second. Images bypass JSON entirely, since base64 would inflate
+pixels by a third for nothing.
+
+</details>
+
+### The recorder never lets a disk touch the capture thread
+
+A 1 kHz loop has **1 ms per cycle**. An fsync, a log rotation or a GC pause can exceed that by an
+order of magnitude. If the capture thread writes, a disk hiccup does not slow the recording down,
+it puts a **hole** in it.
+
+So capture threads only enqueue and one writer thread drains. The queue is **bounded** on purpose:
+
+```
+  unbounded  ->  a slow disk becomes unbounded memory growth. The process dies
+                 later, harder, and further from the cause.
+  bounded    ->  back-pressure is visible immediately, and the drop policy is an
+                 explicit decision rather than an accident.
+```
+
+When full it drops the newest sample and **counts it**, exposed as `dropped_queue` in the API.
+Blocking would stall capture, which is the thing being protected. A recording with 12 counted
+gaps is usable and honest; 12 uncounted gaps is neither.
+
+*On Python: this is acceptable only because every thread is I/O bound and releases the GIL. A real
+1 kHz control loop belongs in C++. This process observes the bus rather than closing a loop over
+it, so the bar is much lower. Stated in `recorder.py` rather than left to be discovered.*
+
+### /timing is the group most pipelines throw away
+
+Every exported episode carries its per-sample timing error, plus bias and jitter in the file
+attributes:
+
+```
+/observations/joint_position   (N, 14)
+/observations/images/<camera>  (N, H, W, 3)   chunked one frame per chunk
+/timing/joint_dt_s             (N,)           distance to nearest real sample
+/timing/camera_dt_s/<camera>   (N,)           signed staleness
+attrs: align_policy, align_anchor, bias_ms/<cam>, jitter_ms/<cam>, is_mock
+```
+
+Which makes **alignment quality a filterable property of the dataset**: a training run can reject
+episodes whose bias exceeds a threshold. That is the payoff for measuring it in Task 3 rather than
+assuming it. Images are chunked one frame per chunk because a shuffling dataloader reads random
+timesteps, so chunking across time would force decompressing a whole block to reach one frame.
+
+### The API
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/episodes` | List, newest first. Reads sidecars only, never recordings |
+| `GET` | `/api/episodes/{id}` | Full metadata plus existing exports |
+| `GET` | `/api/episodes/{id}/download` | Raw MCAP, or `?fmt=h5&policy=...` for an aligned view |
+| `POST` | `/api/episodes/{id}/export` | Generate an aligned HDF5 under a chosen policy |
+| `POST` | `/api/record/start` | Begin an episode. **409** if one is running |
+| `POST` | `/api/record/stop` | Finalise. **409** if none is running |
+| `GET` | `/api/status` | Queue depth, sample counts, back-pressure drops |
+| `GET` | `/api/live` | Latest joint snapshot, whether or not recording |
+
+Two deliberate choices. **Capture runs continuously from process start; recording is a separate
+flag**, so the dashboard shows live state before anyone presses Start, and Start cannot miss the
+first samples. And **conflicts return 409 rather than silently succeeding** — a UI convinced it
+started a second recording when it did not is worse than an error.
+
+Listing reads the sidecar JSON, never the recording. `GET /episodes` across a thousand episodes
+must not mean opening a thousand multi-gigabyte files.
+
+### Measured
+
+```console
+episode      20260810T030208_050   mock=True
+duration     3.00 s
+joints       3000 @ 998.0 Hz
+frames       {'wrist_left': 90, 'wrist_right': 90, 'ceiling': 44, 'zed_head': 180}
+dropped      {'ceiling': 1}          <- from sequence gaps, not arrival counts
+queue drops  0
+
+export hermite  -> mock_...hermite.h5   180 samples  synthetic=True
+export nearest  -> mock_...nearest.h5   180 samples  synthetic=False
+```
+
+### Two things running it revealed
+
+**The export duplicates frames.** That 3 s episode holds 404 unique frames and the export writes
+**720 image slots**, because the 15 fps ceiling camera is repeated roughly 4x to fill a 60 fps
+anchor timeline. Inherent to anchoring, and precisely why LeRobot stores video separately and
+indexes into it rather than materialising every frame at every timestep. With more time that is
+the first thing I would change.
+
+**Raw image storage does not scale.** Four cameras at full resolution is roughly **150 MB/s**,
+which is not something you keep. Fine for 80x60 synthetic frames, wrong for production, where
+this needs h264/AV1 with a frame-index-to-timestamp map. Both gaps are written into
+`storage/base.py` rather than left to be discovered.
+
+---
+
+## Task 5 - monitoring dashboard
+
+Not yet started. Section to follow.
 
 ---
 
