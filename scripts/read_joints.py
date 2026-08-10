@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Task 2 — read live joint position, velocity and torque.
+"""Task 2: read live joint position, velocity and torque.
 
 Prints a refreshing table of all 14 joints plus the bus health counters that
 tell you whether to trust it.

@@ -1,4 +1,4 @@
-# Task 1 — CAN FD interface setup
+# Task 1: CAN FD interface setup
 
 **Status: not performed. No hardware.**
 
@@ -14,7 +14,7 @@ from documentation rather than something I have observed.
 
 ## 1. The physical setup
 
-CAN is a two-wire differential bus — CAN High and CAN Low, twisted together. All nodes
+CAN is a two-wire differential bus: CAN High and CAN Low, twisted together. All nodes
 share the same pair; there is no wire per motor. Each frame carries an ID, and each motor
 acts only on frames matching its own.
 
@@ -29,15 +29,15 @@ robot PC ──[CAN adapter]──┬──────┬──────┬�
 Two physical checks before any software, both of which silently ruin a bus if wrong:
 
 1. **Termination.** 120 Ω at each end of the bus, and only at the ends. Missing
-   termination gives reflections that look like random CRC errors under load — an
+   termination gives reflections that look like random CRC errors under load, an
    intermittent fault that is easy to misdiagnose as a software bug.
 2. **Common ground** between the adapter and the motor supply. CAN is differential but
    not isolated; without a shared reference the common-mode voltage drifts out of range.
 
 ### Why two buses rather than one
 
-The brief specifies two interfaces. My reading of why — **[UNVERIFIED, this is my own
-estimate, not from the OpenArm docs]**:
+The brief specifies two interfaces. My reading of why follows.
+**[UNVERIFIED, this is my own estimate, not from the OpenArm docs]**
 
 A CAN FD frame with an 8-byte payload spends roughly 30 bits in the arbitration phase at
 1 Mbit/s (~30 µs) and roughly 85 bits in the data phase at 5 Mbit/s (~17 µs), plus
@@ -52,7 +52,7 @@ One arm at 1 kHz needs a command and a reply for each of 7 motors:
 ```
 
 70 % is past the point where arbitration delay becomes significant and worst-case latency
-stops being predictable — the usual design guidance is to stay below 50–60 %. Putting
+stops being predictable. The usual design guidance is to stay below 50 to 60 %. Putting
 both arms on one bus would mean ~140 %, which is simply impossible.
 
 Split one arm per bus and each sits near **35 %**, with headroom for retransmission.
@@ -94,7 +94,7 @@ sudo ip link set can0 txqueuelen 1000
 | Flag | Why |
 |---|---|
 | `bitrate 1000000` | Arbitration phase. Every node must agree, and this phase is where bus arbitration happens, so it stays slow and robust. |
-| `dbitrate 5000000` | Data phase — the 5 Mbit/s from the brief. CAN FD's core trick: once a node has won arbitration nobody else is competing, so the payload can be clocked much faster. |
+| `dbitrate 5000000` | Data phase, the 5 Mbit/s from the brief. CAN FD's core trick: once a node has won arbitration nobody else is competing, so the payload can be clocked much faster. |
 | `fd on` | Enables CAN FD. Without it the controller stays in classic mode: 8-byte payloads, no data-phase switch. |
 | `sample-point 0.75` | **My addition, not in the OpenArm guide.** Where in each bit the controller samples. 0.75 is the CiA-recommended value at these rates; it trades noise margin against tolerance for clock mismatch between nodes. |
 | `txqueuelen 1000` | **My addition, not in the OpenArm guide.** Kernel-side transmit buffer. The default of 10 is sized for a low-rate bus and will drop outbound frames at 1 kHz across 7 motors. |
@@ -111,7 +111,7 @@ Two deliberate omissions:
 
 ---
 
-## 3. Verification — what the screenshot would show
+## 3. Verification: what the screenshot would show
 
 ```bash
 ip -details -statistics link show can0
@@ -133,10 +133,10 @@ Expected, with the parts that matter marked:
 
 Four things I would actually be checking, in order:
 
-1. **`state UP`** — the interface is running.
-2. **`mtu 72`** — 64 data bytes + 8 header. An mtu of 16 means FD did not take and the
+1. **`state UP`**: the interface is running.
+2. **`mtu 72`**: 64 data bytes + 8 header. An mtu of 16 means FD did not take and the
    bus is in classic mode, which will not carry full Damiao frames.
-3. **`ERROR-ACTIVE`** — the healthy state. `ERROR-PASSIVE` or `BUS-OFF` means wiring:
+3. **`ERROR-ACTIVE`**: the healthy state. `ERROR-PASSIVE` or `BUS-OFF` means wiring:
    termination, grounding, or a bitrate mismatch.
 4. **Error counters at zero.** Non-zero and climbing on an idle bus is a physical-layer
    fault, not a software one.
@@ -235,7 +235,7 @@ Ranked by how likely I think they are:
 | FD not enabled | `mtu 16`, frames truncated or rejected | `fd on` omitted, or the adapter does not support FD |
 | Missing termination | Intermittent CRC errors that worsen with load | No 120 Ω, or three terminators instead of two |
 | ID collision | Two joints reporting identical values | Two motors flashed with the same CAN ID |
-| Wrong scaling constants | Plausible but physically wrong angles | `MOTOR_SPECS` in `config.py` is **UNVERIFIED** — see below |
+| Wrong scaling constants | Plausible but physically wrong angles | `MOTOR_SPECS` in `config.py` is **UNVERIFIED**, see below |
 
 The last one is the one that worries me, because it is the only one that produces no
 error at all. The position/velocity/torque limits in `config.py` follow the public MIT
@@ -251,7 +251,7 @@ the decoder agrees.**
 Since none of the above could be executed, `openarm_pipeline/can/`:
 
 - implements the real Damiao frame format, and tests it by round trip
-  (`tests/test_protocol.py`) — which proves my parser self-consistent, though not that it
+  (`tests/test_protocol.py`), which proves my parser self-consistent, though not that it
   matches a real motor;
 - puts a `CANSource` interface between the bus and everything downstream, with
   `MockCANSource` and `SocketCANSource` behind it, so hardware bring-up changes one line;

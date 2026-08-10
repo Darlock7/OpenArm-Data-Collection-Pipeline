@@ -87,7 +87,7 @@ makes alignment quality a filterable property of the dataset instead of an assum
 
 ---
 
-## Task 1 — CAN FD interface setup
+## Task 1: CAN FD interface setup
 
 > *"Follow the setup guide to configure the CAN FD interfaces. Run `openarm-can-cli
 > can_configure` and set the zero position on both can0 and can1. Show a screenshot or terminal
@@ -105,8 +105,8 @@ reasoning from documentation rather than something I observed.
 The single most useful thing I worked out while reading the spec. The task hands you `can0` and
 `can1` without saying why, and the reason falls out of arithmetic.
 
-Each motor exchanges **two messages per control cycle** — a command from the host and a reply
-from the motor — and both travel on the same shared pair of wires. At the 1 kHz control loop
+Each motor exchanges **two messages per control cycle**, a command from the host and a reply
+from the motor, and both travel on the same shared pair of wires. At the 1 kHz control loop
 OpenArm 2.0 runs:
 
 ```
@@ -116,11 +116,11 @@ OpenArm 2.0 runs:
 ```
 
 70 % is already past the point where arbitration delay makes worst-case latency unpredictable;
-the usual design guidance is to stay under 50–60 %. **Both arms on one bus would need ~140 %,
+the usual design guidance is to stay under 50 to 60 %. **Both arms on one bus would need ~140 %,
 which is not physically possible.** Split one arm per bus and each sits near **35 %**, with
 headroom for retransmission.
 
-> **[UNVERIFIED]** — this is my own estimate, not a figure from the OpenArm docs, and the frame
+> **[UNVERIFIED]**: this is my own estimate, not a figure from the OpenArm docs, and the frame
 > timing is approximate. If the rig uses a single broadcast sync frame instead of per-motor
 > commands, the count drops substantially. The conclusion holds either way: one bus cannot carry
 > both arms.
@@ -128,7 +128,7 @@ headroom for retransmission.
 ### Bringing the interfaces up
 
 SocketCAN presents a CAN adapter as an ordinary Linux network interface, so it is configured
-with `ip link` — the same tool used for ethernet.
+with `ip link`, the same tool used for ethernet.
 
 ```bash
 # docs.openarm.dev/software/setup/can-setup/
@@ -142,7 +142,7 @@ openarm-can-cli -i can0 can_configure                                    # then 
 Then identically for `can1`. Note `-i` precedes the subcommand.
 
 On top of the documented command I would add `sample-point 0.75`, `dsample-point 0.75` and
-`txqueuelen 1000`. **Those three are mine, not OpenArm's** — reasoning in the fold below.
+`txqueuelen 1000`. **Those three are mine, not OpenArm's.** Reasoning in the fold below.
 
 <details>
 <summary><b>Why each flag is there, and two deliberate omissions</b></summary>
@@ -153,7 +153,7 @@ On top of the documented command I would add `sample-point 0.75`, `dsample-point
 |---|---|
 | `bitrate 1000000` | Arbitration phase. Every node must agree on it, and it is where bus arbitration happens, so it stays slow and robust. |
 | `dbitrate 5000000` | Data phase. CAN FD's core trick: once a node has won arbitration nobody is competing, so the payload can clock much faster. |
-| `fd on` | Enables CAN FD. Without it the controller stays in classic mode — 8-byte payloads, no data-phase switch. |
+| `fd on` | Enables CAN FD. Without it the controller stays in classic mode: 8-byte payloads, no data-phase switch. |
 | `sample-point 0.75` | **Mine, not in the OpenArm guide.** Where in each bit the controller samples. The CiA-recommended value at these rates; trades noise margin against tolerance for clock mismatch between nodes. |
 | `txqueuelen 1000` | **Mine, not in the OpenArm guide.** Kernel transmit buffer. The default of 10 is sized for a low-rate bus and will drop outbound frames at 1 kHz across 7 motors. |
 
@@ -182,10 +182,10 @@ $ ip -details -statistics link show can0
 
 Four things I would actually check, in order:
 
-1. **`state UP`** — the interface is running.
-2. **`mtu 72`** — 64 data bytes + 8 header, so FD is active. **`mtu 16` means FD did not take**
+1. **`state UP`**: the interface is running.
+2. **`mtu 72`**: 64 data bytes + 8 header, so FD is active. **`mtu 16` means FD did not take**
    and the bus is in classic mode, which will not carry full Damiao frames.
-3. **`ERROR-ACTIVE`** — the healthy state. `ERROR-PASSIVE` or `BUS-OFF` points at wiring:
+3. **`ERROR-ACTIVE`**: the healthy state. `ERROR-PASSIVE` or `BUS-OFF` points at wiring:
    termination, grounding, or a bitrate mismatch.
 4. **Error counters at zero.** Non-zero and climbing on an idle bus is a physical-layer fault,
    not a software one.
@@ -200,7 +200,7 @@ It is the same operation as taring a scale, and it matters for the same reason: 
 "joint 4 at 0.5 rad" means something different every session, and a policy trained on Monday's
 data is handed a different coordinate frame on Tuesday.
 
-The arm is not posed by hand for this. It goes into a **purpose-built calibration jig** — press
+The arm is not posed by hand for this. It goes into a **purpose-built calibration jig**: press
 the arm pipe into the jig recess, seat the trigger flat against the jig face, clamp the body,
 fasten with two 12 mm M2 screws, then mirror on the other side. That is the point of the jig:
 the reference pose is repeatable to a machined surface rather than to someone's judgement.
@@ -237,7 +237,7 @@ Ranked by how likely I think they are:
 | FD not enabled | `mtu 16`, frames truncated or rejected | `fd on` omitted, or adapter lacks FD support |
 | Missing termination | Intermittent CRC errors, worse under load | No 120 Ω, or three terminators instead of two |
 | ID collision | Two joints reporting identical values | Two motors flashed with the same CAN ID |
-| **Wrong scaling constants** | **Plausible but physically wrong angles** | **See below — the one that worries me** |
+| **Wrong scaling constants** | **Plausible but physically wrong angles** | **See below. The one that worries me** |
 
 </details>
 
@@ -246,7 +246,7 @@ Ranked by how likely I think they are:
 Damiao motors do not transmit floating-point numbers. They transmit integers, and both ends must
 agree on what physical range those integers span. Those limits live in
 [`config.py`](openarm_pipeline/config.py) as `MOTOR_SPECS`, and they follow the **public MIT-mode
-convention** — I could not check them against a Damiao datasheet.
+convention**, and I could not check them against a Damiao datasheet.
 
 **If they are wrong, nothing breaks.** The decoder returns smooth, believable numbers in the
 wrong units, with no error and no warning. It is the only failure mode on the list that is
@@ -257,7 +257,7 @@ agrees. Ten minutes, and it either validates the whole read path or invalidates 
 
 ### What I built instead
 
-- The **real Damiao frame format**, tested by round trip — proving my parser self-consistent,
+- The **real Damiao frame format**, tested by round trip, which proves my parser self-consistent
   though not that it matches a real motor
 - A `CANSource` interface between the bus and everything downstream, with `MockCANSource` and
   `SocketCANSource` behind it, so hardware bring-up is a one-line change
@@ -269,7 +269,7 @@ agrees. Ten minutes, and it either validates the whole read path or invalidates 
 [calibration workflow](https://docs.openarm.dev/hardware/openarm-ker/calibration-workflow) ·
 [enactic/openarm_can](https://github.com/enactic/openarm_can)
 
-📄 **Full detail:** [`docs/01-can-setup.md`](docs/01-can-setup.md) — physical layer, termination and
+📄 **Full detail:** [`docs/01-can-setup.md`](docs/01-can-setup.md). Physical layer, termination and
 grounding, every flag, the complete failure table, and references.
 
 ---
@@ -778,7 +778,7 @@ timesteps, so chunking across time would force decompressing a whole block to re
 
 Two deliberate choices. **Capture runs continuously from process start; recording is a separate
 flag**, so the dashboard shows live state before anyone presses Start, and Start cannot miss the
-first samples. And **conflicts return 409 rather than silently succeeding** — a UI convinced it
+first samples. And **conflicts return 409 rather than silently succeeding**, because a UI convinced it
 started a second recording when it did not is worse than an error.
 
 Listing reads the sidecar JSON, never the recording. `GET /episodes` across a thousand episodes

@@ -4,7 +4,7 @@ Everything here is a statement about the hardware, not about our software.
 Keeping it in one file means the rest of the codebase never hardcodes a
 joint count or a frame rate.
 
-SOURCES / CONFIDENCE — read this before trusting a number:
+SOURCES / CONFIDENCE: read this before trusting a number.
   * 7 DOF per arm, bimanual (14 total), CAN-FD control bus, Damiao QDD
     motors: stated in the OpenArm 2.0 docs and the task brief.
   * 5 Mbit/s data phase: stated in the task brief.
@@ -126,7 +126,7 @@ CAMERAS: tuple[CameraSpec, ...] = (
 CAMERA_NAMES: list[str] = [c.name for c in CAMERAS]
 
 #: The camera whose frames define the training timeline. See
-#: docs/02-sync-design.md -- imitation learning wants one sample per
+#: cameras/sync.py -- imitation learning wants one sample per
 #: observation, and the observation is an image.
 PRIMARY_CAMERA = "zed_head"
 
@@ -146,5 +146,5 @@ SYNC_TOLERANCE_S = 0.005
 
 #: Bounded queue depth between capture threads and the writer. Bounded on
 #: purpose: an unbounded queue converts a disk stall into unbounded memory
-#: growth, which fails later and worse. See docs/02-sync-design.md.
+#: growth, which fails later and worse. See recorder.py.
 QUEUE_MAXSIZE = 2048
