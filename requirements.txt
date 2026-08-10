@@ -1,5 +1,8 @@
 numpy>=1.24
 h5py>=3.10
+mcap>=1.2
 fastapi>=0.110
 uvicorn[standard]>=0.27
-python-can>=4.3  # only needed for real hardware
+python-can>=4.3  # hardware capture only
+pytest>=8.0  # tests
+httpx>=0.27  # test client
