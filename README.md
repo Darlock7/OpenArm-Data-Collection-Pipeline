@@ -1,6 +1,6 @@
 <div align="center">
 
-# OpenArm 2.0 — Data Collection Pipeline
+# OpenArm 2.0-Data Collection Pipeline
 
 **A teleoperation recording platform for the [OpenArm 2.0](https://docs.openarm.dev) bimanual robot arm.**
 Reads joint state over CAN FD, synchronises it with four camera streams, stores episodes for
