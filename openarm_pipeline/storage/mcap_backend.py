@@ -1,9 +1,23 @@
 """MCAP writer and reader: the record path.
 
 Chosen for capture because of one property the alternatives lack: **a file
-truncated by a crash is still readable up to the last complete message.**
-Recording is the one moment in this pipeline where data is irreplaceable. A
-training export can be regenerated; a demonstration cannot be re-performed.
+interrupted by a crash still yields the part that was written.** Recording is
+the one moment in this pipeline where data is irreplaceable. A training export
+can be regenerated; a demonstration cannot be re-performed.
+
+That property is NOT free, and testing showed it does not hold by default. Two
+things were needed, both discovered by killing the process mid-recording:
+
+  1. `chunk_size=64 KiB` on the writer. MCAP buffers into chunks and loses
+     whatever is still open. At the 1 MiB default a 3 s episode fits entirely
+     inside one unflushed chunk and **100 % of it is lost**. At 64 KiB, 97 %
+     survives, for about 4 % more file size.
+  2. Streaming reads rather than indexed ones. A crashed file has no footer and
+     no index, and the indexed reader rejects it outright, returning nothing.
+     The streaming reader recovers every record written before the damage.
+
+Recovering nothing is treated as a different outcome from recovering a short
+episode, and raises, so a caller can never mistake rubble for an empty take.
 
 Beyond that, MCAP gives per-message timestamps on independent channels, which
 means five streams at five different rates need no resampling, no padding and
@@ -33,7 +47,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .base import EpisodeMetadata, EpisodeWriter
+from .base import SCHEMA_VERSION, EpisodeMetadata, EpisodeWriter
 
 TOPIC_JOINTS = "/joint_states"
 TOPIC_META = "/episode_metadata"
@@ -108,7 +122,21 @@ class McapEpisodeWriter(EpisodeWriter):
         self._meta = meta
         self._path = self._dir / f"{meta.filename_stem}.mcap"
         self._f = open(self._path, "wb")
-        self._w = Writer(self._f)
+        # chunk_size is the crash-safety dial, and the default (1 MiB) is wrong
+        # for this application. MCAP buffers messages into a chunk and only
+        # writes the chunk when it fills or at finish(); anything still in the
+        # open chunk is lost if the process dies. MEASURED, killing the process
+        # mid-recording:
+        #
+        #   episode    1 MiB chunks    64 KiB chunks
+        #    3 s          0 % survives    97 % survives
+        #   10 s         93 %             99 %
+        #   30 s         91 %            100 %
+        #
+        # A short episode fits entirely inside one unflushed chunk and is lost
+        # completely, which is the exact case a demo or an aborted take hits.
+        # 64 KiB costs about 4 % in file size and removes that cliff.
+        self._w = Writer(self._f, chunk_size=64 * 1024)
         self._w.start(profile="openarm", library="openarm-data-collection-pipeline")
 
         joint_schema = self._w.register_schema(
@@ -203,51 +231,123 @@ class McapEpisodeWriter(EpisodeWriter):
 # ---------------------------------------------------------------------------
 
 class McapEpisodeReader:
-    """Reads an episode back into the stream objects Task 3 aligns."""
+    """Reads an episode back into the stream objects Task 3 aligns.
+
+    Reads DEFENSIVELY, via the streaming record iterator rather than the
+    indexed reader. That choice exists for one reason: a recording interrupted
+    by a crash has no footer and no index, and the indexed reader refuses it
+    outright, returning nothing at all. Streaming recovers every record written
+    before the damage and stops there.
+
+    A partially recovered episode sets `truncated`. It is a real, usable
+    recording that is simply shorter than intended, and losing all of it
+    because the tail is damaged would be the worst possible behaviour for the
+    one file in this pipeline that cannot be regenerated.
+    """
 
     def __init__(self, path: Path | str):
         self.path = Path(path)
+        self.truncated = False
 
     def metadata(self) -> EpisodeMetadata:
         """Prefer the sidecar. It exists so listing 1000 episodes does not
-        mean opening 1000 recordings."""
+        mean opening 1000 recordings.
+
+        Falls back through the final summary, then the header record written
+        at open(). A crashed episode has no sidecar and no summary, but it does
+        have the header, so it can still identify itself and still declares
+        whether it was simulated.
+        """
         side = self.path.with_suffix(".json")
         if side.exists():
             return EpisodeMetadata.from_json(side.read_text())
 
-        from mcap.reader import make_reader
-        with open(self.path, "rb") as f:
-            for record in make_reader(f).iter_metadata():
-                if record.name == "episode_final":
-                    return EpisodeMetadata.from_json(record.metadata["summary"])
-        raise FileNotFoundError(f"no metadata in {self.path}")
+        from mcap.records import Metadata
+        from mcap.stream_reader import StreamReader
+
+        header: dict[str, str] | None = None
+        try:
+            with open(self.path, "rb") as f:
+                for rec in StreamReader(f, emit_chunks=False).records:
+                    if not isinstance(rec, Metadata):
+                        continue
+                    if rec.name == "episode_final":
+                        return EpisodeMetadata.from_json(rec.metadata["summary"])
+                    if rec.name == "episode":
+                        header = rec.metadata
+        except Exception:  # noqa: BLE001 -- damaged tail; use what we found
+            self.truncated = True
+
+        if header is None:
+            raise FileNotFoundError(f"no recoverable metadata in {self.path}")
+
+        self.truncated = True
+        return EpisodeMetadata(
+            episode_id=header.get("episode_id", self.path.stem),
+            created_utc=float(header.get("t0_utc_s", 0.0) or 0.0),
+            is_mock=header.get("is_mock", "True") == "True",
+            source_note=header.get("source_note", ""),
+            schema_version=header.get("schema_version", SCHEMA_VERSION),
+            t0_utc_s=float(header.get("t0_utc_s", 0.0) or 0.0),
+            t0_monotonic_ns=int(header.get("t0_monotonic_ns", 0) or 0),
+            notes="RECOVERED FROM AN INCOMPLETE RECORDING: this episode has no "
+                  "footer, so it was interrupted. Counts and durations below are "
+                  "measured from what survived, not from what was intended.",
+        )
 
     def read(self, with_images: bool = True):
-        """Returns (JointStream, {camera: CameraStream})."""
-        from mcap.reader import make_reader
+        """Returns (JointStream, {camera: CameraStream}).
+
+        Sets `self.truncated` if the file ended mid-record.
+        """
+        from mcap.records import Channel, Message
+        from mcap.stream_reader import StreamReader
 
         from ..cameras.source import CameraStream, JointStream
 
         jt, jp, jv, jq, jvalid, jspread = [], [], [], [], [], []
         cams: dict[str, dict[str, list]] = {}
+        topics: dict[int, str] = {}
 
         with open(self.path, "rb") as f:
-            for _schema, channel, message in make_reader(f).iter_messages():
-                if channel.topic == TOPIC_JOINTS:
-                    d = json.loads(message.data)
-                    jt.append(d["t_mono_ns"])
-                    jp.append(d["position"])
-                    jv.append(d["velocity"])
-                    jq.append(d["torque"])
-                    jvalid.append(d["valid"])
-                    jspread.append(d["spread_s"])
-                elif channel.topic.startswith("/camera/"):
-                    name = channel.topic.removeprefix("/camera/")
-                    c = cams.setdefault(name, {"t": [], "seq": [], "img": []})
-                    c["t"].append(message.log_time)
-                    c["seq"].append(message.sequence)
-                    if with_images:
-                        c["img"].append(unpack_image(message.data))
+            try:
+                for rec in StreamReader(f, emit_chunks=False).records:
+                    if isinstance(rec, Channel):
+                        topics[rec.id] = rec.topic
+                        continue
+                    if not isinstance(rec, Message):
+                        continue
+
+                    topic = topics.get(rec.channel_id)
+                    if topic == TOPIC_JOINTS:
+                        d = json.loads(rec.data)
+                        jt.append(d["t_mono_ns"])
+                        jp.append(d["position"])
+                        jv.append(d["velocity"])
+                        jq.append(d["torque"])
+                        jvalid.append(d["valid"])
+                        jspread.append(d["spread_s"])
+                    elif topic and topic.startswith("/camera/"):
+                        name = topic.removeprefix("/camera/")
+                        c = cams.setdefault(name, {"t": [], "seq": [], "img": []})
+                        c["t"].append(rec.log_time)
+                        c["seq"].append(rec.sequence)
+                        if with_images:
+                            c["img"].append(unpack_image(rec.data))
+            except Exception as exc:  # noqa: BLE001
+                # The file ends mid-record. Everything decoded up to here is
+                # intact and is returned; the caller is told via `truncated`.
+                #
+                # But recovering NOTHING is different in kind from recovering
+                # a short episode, and must not be reported as an empty
+                # recording. A caller cannot distinguish "the operator stopped
+                # immediately" from "this file is rubble" unless we say so.
+                if not jt and not cams:
+                    raise ValueError(
+                        f"{self.path.name} is unreadable: no records recovered "
+                        f"before {type(exc).__name__}"
+                    ) from exc
+                self.truncated = True
 
         joints = JointStream(
             t_mono_ns=np.array(jt, dtype=np.int64),

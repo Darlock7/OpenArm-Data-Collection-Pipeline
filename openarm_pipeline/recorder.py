@@ -137,10 +137,21 @@ class Recorder:
             t.join(timeout=2.0)
         self._threads.clear()
 
-    def start_recording(self, notes: str = "") -> RecorderStatus:
+    def start_recording(self, notes: str = "") -> RecorderStatus | None:
+        """Begin an episode. Returns None if one is already running.
+
+        The already-running check happens INSIDE the lock and the answer is
+        returned to the caller, rather than the caller checking `status()`
+        first and then calling this. That ordering matters: two concurrent
+        requests both read `running == False`, both proceed, and although the
+        lock still ensures only one file is opened, the loser is told it
+        succeeded. A client convinced it started a recording that does not
+        exist is worse than an error, so the decision and the report have to
+        be the same atomic step.
+        """
         with self._lock:
             if self._recording.is_set():
-                return self.status()
+                return None
             if not self._threads:
                 self.start_capture()
 

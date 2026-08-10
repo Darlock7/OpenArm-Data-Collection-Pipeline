@@ -319,6 +319,10 @@ def align(joints: JointStream,
     else:
         raise ValueError(f"unknown joint_policy {joint_policy!r}")
 
+    # Samples with nothing behind them come out as NaN rather than zero. That
+    # is deliberate: NaN propagates loudly if a consumer ignores `joint_valid`,
+    # while 0.0 would sit in the array looking like a real joint angle.
+    #
     # Valid means: inside the recorded span, and close enough to a real sample.
     # Outside the span the interpolator holds at the endpoint, which is a
     # guess, so it is marked rather than silently trusted.

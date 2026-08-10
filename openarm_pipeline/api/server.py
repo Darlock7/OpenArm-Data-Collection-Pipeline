@@ -127,9 +127,13 @@ def camera_frame(name: str) -> Response:
 
 @app.post("/api/record/start", tags=["recorder"])
 def start_recording(notes: str = Query("", description="free text stored in metadata")) -> dict:
-    if recorder.status().running:
-        raise HTTPException(409, "a recording is already running")
+    # No pre-check here on purpose. Asking `status()` first and then starting
+    # is a check-then-act race: under concurrent requests both callers see
+    # "not running" and both are told they succeeded. The recorder decides
+    # inside its own lock and returns None to the loser.
     s = recorder.start_recording(notes=notes)
+    if s is None:
+        raise HTTPException(409, "a recording is already running")
     return {"started": True, "episode_id": s.episode_id, "is_mock": s.is_mock}
 
 

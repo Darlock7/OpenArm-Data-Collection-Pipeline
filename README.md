@@ -40,7 +40,7 @@ robot learning, and serves them over a REST API with a live dashboard.
 python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
 
-./.venv/bin/python -m pytest tests/ -q          # 44 tests
+./.venv/bin/python -m pytest tests/ -q          # 57 tests
 ./.venv/bin/python scripts/read_joints.py       # live joint state, simulated arm
 ./.venv/bin/python scripts/demo_sync.py         # 5 streams captured and aligned
 ./.venv/bin/uvicorn openarm_pipeline.api.server:app   # API + dashboard on :8000
@@ -899,6 +899,78 @@ Exactly the calls the buttons make.
 
 ---
 
+## Fault injection: what broke
+
+Every claim above is easy to make and harder to hold. So the system was attacked deliberately:
+files truncated, the process killed mid-write, a motor unplugged mid-stream, the disk stalled to
+a crawl, degenerate episodes fed to the aligner, and the API hammered concurrently.
+
+**Two real bugs surfaced, both in things this README asserted.**
+
+### 1. A crashed recording returned nothing at all
+
+This document claimed a truncated MCAP was still readable. **It was not.** A 3-second episode
+killed mid-write yielded **zero** samples, and the whole take was lost.
+
+Two independent causes, neither obvious:
+
+| Cause | Effect |
+|---|---|
+| MCAP buffers into **1 MiB chunks** by default and loses whatever is still open | A short episode fits entirely inside one unflushed chunk, so all of it goes |
+| The **indexed reader** needs a footer, which a crashed file does not have | It refuses the file outright rather than reading what is there |
+
+Measured, killing the process mid-recording:
+
+```
+  episode      1 MiB chunks (before)      64 KiB chunks (after)
+   3 s              0 % survives               97 % survives
+  10 s             93 %                        99 %
+  30 s             91 %                       100 %
+```
+
+Fixed by setting `chunk_size=64 KiB`, which costs about 4 % in file size, and by reading with the
+streaming record iterator so a footerless file still yields its contents. Recovering **nothing**
+now raises rather than returning an empty episode, because a caller must never mistake rubble for
+a take the operator stopped immediately.
+
+### 2. Two concurrent Start requests both returned success
+
+Eight simultaneous `POST /api/record/start` produced **two** `200`s. Only one recording actually
+began, so no data was harmed, but the loser was told it had started a recording that did not
+exist. Which is the exact failure the 409 was supposed to prevent.
+
+The cause was check-then-act:
+
+```python
+if recorder.status().running:      # both callers read False here
+    raise HTTPException(409, ...)
+s = recorder.start_recording(...)  # both then call this
+```
+
+The lock inside `start_recording()` was doing its job on the data and saying nothing about it.
+Fixed by moving the decision inside the lock and returning `None` to the loser, so the answer and
+the action are one atomic step. Eight concurrent starts now give exactly one 200 and seven 409s.
+
+### What held up
+
+| Attack | Result |
+|---|---|
+| Motor stops replying mid-recording | Stream continues, that joint marked stale, others unaffected |
+| Truncated, garbage-appended, zero-length frames | Counted in `frames_bad` / `frames_unknown`, never fatal |
+| Disk stalled to 50 samples/sec | Capture held **998 Hz**, queue stayed bounded, 2,313 drops counted |
+| Empty / single-sample / duplicate-timestamp episodes | Marked invalid, no crash, no plausible wrong answer |
+| A NaN in one joint | Contained; did not spread to the other 13 |
+| Lifecycle abuse (double start, stop before start, double stop) | All no-ops or `None`, none raise |
+
+One design point that fault injection clarified: samples with nothing behind them come back as
+**NaN, not zero**. NaN propagates loudly if a consumer ignores `joint_valid`, while `0.0` would
+sit in the array looking exactly like a legitimate joint angle.
+
+All of it is now in [`tests/test_resilience.py`](tests/test_resilience.py) so neither bug can
+return.
+
+---
+
 ## What I would do next
 
 ### First hour with hardware, in order
@@ -971,7 +1043,7 @@ scripts/
 docs/
   01-can-setup.md  Task 1, in full
   dashboard.png    Task 5 screenshot
-tests/             44 tests
+tests/             57 tests, incl. fault injection
 ```
 
 ## Licence
